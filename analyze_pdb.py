@@ -1,149 +1,228 @@
-import pymol
-from pymol import cmd
-import sys
 import os
+import sys
 import csv
 import re
+import logging
 import time
 from datetime import datetime
+from collections import defaultdict
+from Bio.PDB import PDBParser, PDBIO
+from Bio.PDB.SASA import ShrakeRupley
+import pymol
+from pymol import cmd
+
+# 配置日志记录
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 def parse_residue(res_str):
-    """解析残基字符串格式为(名称, 编号)，例如'ARG15' -> ('ARG', '15')"""
+    """解析残基字符串为(名称, 编号)"""
     match = re.match(r'^([A-Za-z]+)(\d+)$', res_str)
     if not match:
         raise ValueError(f"Invalid residue format: {res_str}")
     return (match.group(1).upper(), match.group(2))
 
-def calculate_catalytic_distance(catalytic_residues):
-    """计算催化残基间距"""
-    res1, res2 = catalytic_residues
-    resn1, resi1 = parse_residue(res1)
-    resn2, resi2 = parse_residue(res2)
-    sel1 = f'resn {resn1} and resi {resi1}'
-    sel2 = f'resn {resn2} and resi {resi2}'
-    cmd.distance('catalytic_dist', sel1, sel2)
-    return cmd.get_distance('catalytic_dist')
+# 删除整个 calculate_catalytic_distance 函数
 
-def count_disulfide_bonds():
-    """统计二硫键数量（SG原子间距≤2.2Å）"""
-    cysteines = cmd.find_pairs('(resn cys & name sg)', '(resn cys & name sg)', 
-                              mode=1, cutoff=2.2)
-    return len(cysteines)
-
-def surface_polar_ratio():
-    """计算表面极性残基占比（溶剂可及性>20）"""
-    cmd.select('surface', 'b > 20')
-    polar = cmd.count_atoms('surface & (resn arg+lys+asp+glu+asn+gln+his+ser+thr+tyr)')
-    total = cmd.count_atoms('surface')
-    return polar/total if total >0 else 0
-
-def hbond_network_strength():
-    """氢键网络强度（3.2Å距离判据，优化版）"""
-    # 供体：主链N (name n) + 侧链N/O (asn/gln的 od/oe)
-    donors = '(resn arg+lys+his+asn+gln+ser+thr+tyr+trp & name n+od1+od2+oe1+oe2)'
-  
-    # 受体：主链O (name o) + 侧链O/N (asp/glu的 od/oe)
-    acceptors = '(resn asp+glu+asn+gln+ser+thr+his+tyr & name o+od1+od2+oe1+oe2)'
-  
-    hbonds = cmd.find_pairs(donors, acceptors, mode=1, cutoff=3.2)
-    valid_hbonds = [pair for pair in hbonds if pair[0][1] != pair[1][1]]
-  
-    return len(valid_hbonds)
-
-def hydrophobic_core_density():
-    """疏水核心接触点（溶剂可及性<10且距离<5Å）"""
-    cmd.select('hydrophobic_core', 'resn ala+val+ile+leu+phe+trp+pro+met & b < 10')
-    contacts = cmd.find_pairs('hydrophobic_core', 'hydrophobic_core', cutoff=5.0)
-    return len(contacts)
-
-def salt_bridge_density():
-    """盐桥密度（正负残基间距≤4Å）"""
-    positive = 'resn arg+lys'
-    negative = 'resn asp+glu'
-    salt_bridges = cmd.find_pairs(positive, negative, mode=2, cutoff=4.0)
-    return len(salt_bridges)
-
-def main(pdb_file, catalytic_residues=None):
-    if not cmd.get_names():
-        cmd.reinitialize()
-    obj_name = None
+def analyze_pdb_features(pdb_path):  # 移除 catalytic_residues 参数
+    """PyMOL特征分析"""
+    features = {}
     try:
-        if not os.path.exists(pdb_file):
-            raise FileNotFoundError(f'PDB文件未找到: {pdb_file}')
-          
-        print(f'\n正在加载PDB文件: {pdb_file}')
-        cmd.feedback("disable", "all", "actions")
+        # 初始化PyMOL环境
         cmd.reinitialize()
-        obj_name = os.path.splitext(os.path.basename(pdb_file))[0]
-        cmd.load(pdb_file, obj_name)
+        obj_name = os.path.splitext(os.path.basename(pdb_path))[0]
+        cmd.load(pdb_path, obj_name)
         cmd.set('solvent_radius', 1.4)
-        print('PDB文件加载成功，开始分析...')
       
-        # PyMOL 3.x 兼容预处理
-        cmd.set("ignore_case", 1)
         # 计算溶剂可及性
         cmd.get_area(obj_name, load_b=1)
-        # 移除is_processing检查，改用固定延时确保计算完成
-        time.sleep(2)  # 等待2秒确保溶剂可及性计算完成
-        
+      
+        # 二硫键
+        cysteines = cmd.find_pairs('(resn cys & name sg)', '(resn cys & name sg)', 
+                                 mode=1, cutoff=2.2)
+        features['disulfide_bonds'] = len(cysteines)
+      
+        # 表面极性比例
+        cmd.set('dot_solvent', 1)  # 开启溶剂点计算
+        cmd.set('dot_density', 3)  # 提高点密度
+        cmd.select('surface', 'b > 10')
+        polar = cmd.count_atoms('surface & (resn arg+lys+asp+glu+asn+gln+his+ser+thr+tyr)')
+        total = cmd.count_atoms('surface')
+        features['surface_polar_ratio'] = polar/total if total >0 else 0
+      
+        # 氢键网络（优化版）
+        donors = '(resn arg+lys+his+asn+gln+ser+thr+tyr+trp & name n+od1+od2+oe1+oe2)'
+        acceptors = '(resn asp+glu+asn+gln+ser+thr+his+tyr & name o+od1+od2+oe1+oe2)'
+        hbonds = cmd.find_pairs(donors, acceptors, mode=1, cutoff=3.2)
+        features['hydrogen_bonds'] = len([p for p in hbonds if p[0][1] != p[1][1]])
+      
+        # 疏水核心
+        cmd.select('hydrophobic_core', 'resn ala+val+ile+leu+phe+trp+pro+met & b < 10')
+        contacts = cmd.find_pairs('hydrophobic_core', 'hydrophobic_core', cutoff=5.0)
+        features['hydrophobic_contacts'] = len(contacts)
+      
+        # 盐桥
+        positive = 'resn arg+lys'
+        negative = 'resn asp+glu'
+        salt_bridges = cmd.find_pairs(positive, negative, mode=2, cutoff=4.0)
+        features['salt_bridges'] = len(salt_bridges)
+      
+            
+ 
+        cmd.delete(obj_name)
+    except Exception as e:
+        logging.error(f"PyMOL分析失败: {str(e)}")
+    return features
+
+def extract_biopython_features(pdb_path):
+    """Biopython特征提取（移除DSSP依赖）"""
+    features = {}
+    parser = PDBParser()
+    
+    # 添加警告过滤
+    import warnings
+    from Bio import BiopythonWarning
+  
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', BiopythonWarning)
+            structure = parser.get_structure('protein', pdb_path)
+      
+        # 氨基酸组成
+        aa_count = defaultdict(int)
+        for residue in structure.get_residues():
+            resname = residue.get_resname()
+            if resname not in ['HOH', 'WAT']:
+                aa_count[resname] += 1
+        total = sum(aa_count.values()) or 1
+        features['aa_composition'] = {k: v/total for k, v in aa_count.items()}
+      
+        # SASA计算
+        sasa_calculator = ShrakeRupley()
+        sasa_calculator.compute(structure, level='R')
+        hydrophobic = ['ALA', 'VAL', 'LEU', 'ILE', 'PHE', 'PRO', 'MET', 'TRP']
+        sasa_data = {'total': 0.0, 'count': 0}
+        for residue in structure.get_residues():
+            if residue.get_resname() in hydrophobic:
+                sasa_data['total'] += residue.sasa
+                sasa_data['count'] += 1
+        features['hydrophobic_sasa'] = sasa_data['total']
+        features['mean_sasa'] = sasa_data['total']/sasa_data['count'] if sasa_data['count']>0 else 0
+      
+        # 二级结构（改用PyMOL分析）
+        features.update(calculate_secondary_structure(pdb_path))
       
     except Exception as e:
-        print(f'\n错误发生: {str(e)}')
-        sys.exit(1)
+        logging.error(f"Biopython分析失败: {str(e)}")
       
-    try:
-        sys.stderr.write("\n开始计算结构特征...\n")
-        sys.stdout.flush()
-      
-        catalytic_distance = None
-        if catalytic_residues:
-            catalytic_distance = calculate_catalytic_distance(catalytic_residues)
-            print(f"\n催化残基间距: {catalytic_distance:.2f} Å")
-        else:
-            print("\n未提供催化残基对，跳过距离计算")
+    return features
 
-        print("\n[1/6] 计算二硫键...")
-        disulfide_count = count_disulfide_bonds()
-        print("[2/6] 计算表面极性...")
-        polar_ratio = surface_polar_ratio()
-        print("[3/6] 计算氢键网络...")
-        hbond_strength = hbond_network_strength()
-        print("[4/6] 计算疏水核心...")
-        core_density = hydrophobic_core_density()
-        print("[5/6] 计算盐桥密度...")
-        salt_density = salt_bridge_density()
+def calculate_secondary_structure(pdb_path):
+    """使用PyMOL进行二级结构分析（按残基比例）"""
+    result = {'helix':0.0, 'sheet':0.0, 'loop':0.0}
+    obj_name = os.path.splitext(os.path.basename(pdb_path))[0]
+    
+    try:
+        cmd.reinitialize()
+        cmd.load(pdb_path, obj_name)
+        cmd.dss()  # PyMOL内置二级结构分析
+        
+        # 按残基统计二级结构
+        ss_counter = {'helix': set(), 'sheet': set(), 'loop': set()}
+        cmd.iterate(f"{obj_name} and ss h", 
+                   'ss_counter["helix"].add(f"{model}/{segi}/{chain}/{resi}")', 
+                   space={'ss_counter': ss_counter})
+        cmd.iterate(f"{obj_name} and ss s", 
+                   'ss_counter["sheet"].add(f"{model}/{segi}/{chain}/{resi}")', 
+                   space={'ss_counter': ss_counter})
+        cmd.iterate(f"{obj_name} and ss l", 
+                   'ss_counter["loop"].add(f"{model}/{segi}/{chain}/{resi}")', 
+                   space={'ss_counter': ss_counter})
+        logging.info(f"helix: {len(ss_counter['helix'])}")
+        logging.info(f"sheet: {len(ss_counter['sheet'])}")
+        logging.info(f"loop: {len(ss_counter['loop'])}")
+
+        # 计算残基总数（排除水分子）
+        total_resi = set()
+        cmd.iterate(f"{obj_name} and not resn HOH,WAT", 
+                   'total_resi.add(f"{model}/{segi}/{chain}/{resi}")',
+                   space={'total_resi': total_resi})
+        total = len(total_resi) or 1
+        
+        logging.info(f"total: {total}")
+        # 计算比例
+        result.update({
+            'helix': len(ss_counter['helix']) / total,
+            'sheet': len(ss_counter['sheet']) / total,
+            'loop' : len(ss_counter['loop']) / total
+        })
+        
+        cmd.delete(obj_name)
+    except Exception as e:
+        logging.error(f"PyMOL二级结构分析失败: {str(e)}")
+    
+    return result
+
+def process_directory(input_dir):  # 移除 catalytic_residues 参数
+    """批量处理PDB目录"""
+    # 创建输出目录
+    output_dir = os.path.join(os.getcwd(), 'output')
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 生成带时间戳的输出文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_csv = os.path.join(output_dir, f'analyze_pdb_{timestamp}.csv')  # 修改输出路径
+    
+    # 动态收集所有可能的氨基酸字段
+    all_aa_fields = set()
+    reports = []
+
+    for filename in os.listdir(input_dir):
+        if not filename.lower().endswith('.pdb'):
+            continue
+          
+        pdb_path = os.path.join(input_dir, filename)
+        pdb_id = os.path.splitext(filename)[0]
+        logging.info(f"正在处理: {pdb_id}")
       
-        # 输出结果
-        print(f"二硫键数量: {disulfide_count}")
-        print(f"表面极性残基占比: {polar_ratio:.2%}")
-        print(f"氢键网络强度: {hbond_strength} 个氢键")
-        print(f"疏水核心接触点: {core_density}")
-        print(f"盐桥密度: {salt_density}")
-  
-        csv_filename = f'analysis_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-        with open(csv_filename, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['Metric', 'Value'])
-            if catalytic_distance is not None:
-                writer.writerow(['Catalytic Distance (Å)', f'{catalytic_distance:.2f}'])
-            writer.writerow(['Disulfide Bonds', disulfide_count])
-            writer.writerow(['Surface Polar Ratio', f'{polar_ratio:.2%}'])
-            writer.writerow(['HBond Network Strength', hbond_strength])
-            writer.writerow(['Hydrophobic Core Density', core_density])
-            writer.writerow(['Salt Bridge Density', salt_density])
-        print(f'\n报告已生成: {csv_filename}')
-  
-    finally:
-        if obj_name:
-            cmd.delete(obj_name)
-        if catalytic_residues:
-            cmd.delete('catalytic_dist')
+        # 提取特征
+        report = {'pdb_id': pdb_id}
+        report.update(analyze_pdb_features(pdb_path))  # 参数数量已改变
+        report.update(extract_biopython_features(pdb_path))
+      
+        # 展平氨基酸组成并收集字段
+        aa_comp = report.pop('aa_composition', {})
+        for aa in aa_comp.keys():
+            all_aa_fields.add(f'aa_{aa}')
+        for aa, val in aa_comp.items():
+            report[f'aa_{aa}'] = round(val, 4)
+          
+        reports.append(report)
+
+    # 合并字段到fieldnames
+    # 修改 fieldnames 列表（移除 catalytic_distance）
+    fieldnames = [
+        'pdb_id', 'disulfide_bonds', 'surface_polar_ratio', 'hydrogen_bonds',
+        'hydrophobic_contacts', 'salt_bridges',  # 已移除 catalytic_distance
+        'hydrophobic_sasa', 'mean_sasa', 'helix', 'sheet', 'loop'
+    ] + sorted(all_aa_fields)
+
+    with open(output_csv, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for report in reports:
+            # 填充缺失的氨基酸字段为0
+            for aa_field in all_aa_fields:
+                if aa_field not in report:
+                    report[aa_field] = 0.0
+            writer.writerow(report)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python analyze_pdb.py <pdb_file> [residue1 residue2]")
-        print("Example: python analyze_pdb.py enzyme.pdb ARG15 HIS57")
+        print("Usage: python protein_analyzer.py <input_dir>")  # 简化使用说明
         sys.exit(1)
       
-    catalytic_args = sys.argv[2:4] if len(sys.argv)>=4 else None
-    main(sys.argv[1], catalytic_args)
+    process_directory(sys.argv[1])  # 移除第二个参数
+    logging.info(f"分析完成，结果已保存至 output/ 目录")  # 修改日志输出
