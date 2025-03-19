@@ -10,26 +10,29 @@ pip install pymol-open-source
 
 ## 使用参数
 ```bash
-python analyze_pdb.py <PDB文件路径> [催化残基1 催化残基2]
-# 示例（计算催化残基间距）
-python analyze_pdb.py enzyme.pdb ARG15 HIS57
+python analyze_pdb.py <输入目录路径>
+# 示例（批量处理PDB目录）
+python analyze_pdb.py ./pdb_files/
 ```
 
 ## 输出说明
-生成的CSV报告包含以下字段：
-- Catalytic Distance: 催化残基间距（Å）
+报告文件按时间戳自动命名（如analyze_pdb_YYYYMMDD_HHMMSS.csv），包含以下字段：
 - Disulfide Bonds: 二硫键数量
-- Surface Polar Ratio: 表面极性残基百分比
-- HBond Network Strength: 氢键网络强度
+- Surface Polar Ratio: 表面极性残基百分比（基于溶剂可及性表面计算）
+- Hydrogen Bonds: 跨残基氢键数量
+- Hydrophobic Contacts: 疏水核心接触点
+- Salt Bridges: 盐桥数量
+- Helix/Sheet/Loop: 二级结构比例
 
 ## 常见问题
 1. 依赖安装失败：
    - 确认使用Python 3.6+版本
    - 尝试`pip install --pre pymol-open-source`
 
-2. 催化残基格式要求：
-   - 必须为【氨基酸名称+编号】格式（如HIS57）
-   - 区分大小写（ARG/arg视为不同）
+2. 文件处理要求：
+   - 输入目录需包含至少1个PDB文件
+   - 自动跳过非PDB格式文件
+   - 输出目录自动创建（output/）
 
 3. 文件路径问题：
    - 使用绝对路径或正确相对路径
