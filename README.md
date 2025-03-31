@@ -1,39 +1,77 @@
-# PDB结构分析工具
+# PDB蛋白质最适温度预测模型
 
-## 项目用途
-本脚本用于分析蛋白质PDB文件的结构特征，包括催化残基间距、二硫键数量、表面极性比例等指标。
+本项目使用随机森林算法根据PDB文件的结构特征预测蛋白质的最适温度。该模型使用了从PDB数据分析中提取的多种特征，能够帮助研究人员快速评估蛋白质的热稳定性。
 
-## 依赖安装
+## 功能特点
+
+- 使用随机森林算法训练预测模型
+- 自动优化模型超参数
+- 生成特征重要性分析图表
+- 预测结果可视化
+- 直接分析PDB文件的能力
+- 完整的评估指标(RMSE, MAE, R²)
+
+## 安装依赖
+
+确保已安装所有必要的依赖包：
+
 ```bash
-pip install pymol-open-source
+pip install pandas numpy scikit-learn matplotlib joblib
 ```
 
-## 使用参数
+## 使用方法
+
+### 训练模型
+
+使用默认参数训练模型：
+
 ```bash
-python analyze_pdb.py <输入目录路径>
-# 示例（批量处理PDB目录）
-python analyze_pdb.py ./pdb_files/
+python train_rf_model.py
 ```
 
-## 输出说明
-报告文件按时间戳自动命名（如analyze_pdb_YYYYMMDD_HHMMSS.csv），包含以下字段：
-- Disulfide Bonds: 二硫键数量
-- Surface Polar Ratio: 表面极性残基百分比（基于溶剂可及性表面计算）
-- Hydrogen Bonds: 跨残基氢键数量
-- Hydrophobic Contacts: 疏水核心接触点
-- Salt Bridges: 盐桥数量
-- Helix/Sheet/Loop: 二级结构比例
+自定义训练参数：
 
-## 常见问题
-1. 依赖安装失败：
-   - 确认使用Python 3.6+版本
-   - 尝试`pip install --pre pymol-open-source`
+```bash
+python train_rf_model.py --data ./path/to/your/data.csv --output ./models_custom
+```
 
-2. 文件处理要求：
-   - 输入目录需包含至少1个PDB文件
-   - 自动跳过非PDB格式文件
-   - 输出目录自动创建（output/）
+### 预测新的PDB结构最适温度
 
-3. 文件路径问题：
-   - 使用绝对路径或正确相对路径
-   - 避免路径包含中文或特殊字符
+```bash
+python train_rf_model.py --predict ./path/to/your/pdb_file.pdb
+```
+
+使用自定义模型文件：
+
+```bash
+python train_rf_model.py --predict ./path/to/your/pdb_file.pdb --model ./path/to/your/model.joblib
+```
+
+## 输出文件
+
+模型训练会生成以下文件：
+
+- `rf_temperature_predictor.joblib` - 训练好的随机森林模型
+- `feature_importance.png` - 特征重要性可视化图
+- `predictions_vs_actual.png` - 预测值与真实值对比图
+
+预测模式会生成：
+
+- `prediction_result.csv` - 包含预测结果的CSV文件
+
+## 项目结构
+
+- `train_rf_model.py` - 主要脚本，包含训练和预测功能
+- `analyze_pdb.py` - PDB文件分析脚本，用于提取特征
+- `models/` - 存放训练好的模型
+- `trainData/` - 存放训练数据
+
+## 注意事项
+
+- 该模型需要完整的PDB特征数据才能进行准确预测
+- 模型的准确性取决于训练数据的质量和代表性
+- 对于特殊的PDB结构，可能需要额外的特征工程
+
+## 示例数据
+
+项目默认使用`trainData/analyze_pdb_merged_20250331_164045.csv`文件作为训练数据。该文件包含了多种PDB特征和对应的最适温度数据。

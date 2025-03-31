@@ -165,8 +165,8 @@ def calculate_secondary_structure(pdb_path):
     
     return result
 
-def process_directory(input_dir):  # 移除 catalytic_residues 参数
-    """批量处理PDB目录"""
+def process_directory(input_path):  # 移除 catalytic_residues 参数
+    """批量处理PDB目录或单个PDB文件"""
     # 创建输出目录
     output_dir = os.path.join(os.getcwd(), 'output')
     os.makedirs(output_dir, exist_ok=True)
@@ -179,14 +179,13 @@ def process_directory(input_dir):  # 移除 catalytic_residues 参数
     all_aa_fields = set()
     reports = []
 
-    for filename in os.listdir(input_dir):
-        if not filename.lower().endswith('.pdb'):
-            continue
-          
-        pdb_path = os.path.join(input_dir, filename)
-        pdb_id = os.path.splitext(filename)[0]
-        logging.info(f"正在处理: {pdb_id}")
-      
+    # 判断输入是文件还是目录
+    if os.path.isfile(input_path) and input_path.lower().endswith('.pdb'):
+        # 如果是单个PDB文件
+        pdb_path = input_path
+        pdb_id = os.path.splitext(os.path.basename(pdb_path))[0]
+        logging.info(f"正在处理单个文件: {pdb_id}")
+        
         # 提取特征
         report = {'pdb_id': pdb_id}
         report.update(analyze_pdb_features(pdb_path))
@@ -205,21 +204,63 @@ def process_directory(input_dir):  # 移除 catalytic_residues 参数
                 report['hydrophobic_contacts_norm'] = report['hydrophobic_contacts'] / total_residues
                 report['salt_bridges_norm'] = report['salt_bridges'] / total_residues
                 report['hydrophobic_sasa_norm'] = report['hydrophobic_sasa'] / total_residues
-                # mean_sasa已经是平均值，但如果需要按所有氨基酸平均：
-                # report['mean_sasa_all'] = report['hydrophobic_sasa'] / total_residues
-            
+                
             cmd.delete(obj_name)
         except Exception as e:
             logging.error(f"归一化计算失败: {str(e)}")
-      
+        
         # 展平氨基酸组成并收集字段
         aa_comp = report.pop('aa_composition', {})
         for aa in aa_comp.keys():
             all_aa_fields.add(f'aa_{aa}')
         for aa, val in aa_comp.items():
             report[f'aa_{aa}'] = round(val, 4)
-          
+        
         reports.append(report)
+    elif os.path.isdir(input_path):
+        # 如果是目录，处理所有PDB文件
+        for filename in os.listdir(input_path):
+            if not filename.lower().endswith('.pdb'):
+                continue
+              
+            pdb_path = os.path.join(input_path, filename)
+            pdb_id = os.path.splitext(filename)[0]
+            logging.info(f"正在处理: {pdb_id}")
+          
+            # 提取特征
+            report = {'pdb_id': pdb_id}
+            report.update(analyze_pdb_features(pdb_path))
+            report.update(extract_biopython_features(pdb_path))
+            
+            # 计算蛋白质中的氨基酸总数
+            try:
+                cmd.reinitialize()
+                obj_name = os.path.splitext(os.path.basename(pdb_path))[0]
+                cmd.load(pdb_path, obj_name)
+                total_residues = cmd.count_atoms(f"{obj_name} and name ca")
+                
+                # 归一化相关指标
+                if total_residues > 0:
+                    report['hydrogen_bonds_norm'] = report['hydrogen_bonds'] / total_residues
+                    report['hydrophobic_contacts_norm'] = report['hydrophobic_contacts'] / total_residues
+                    report['salt_bridges_norm'] = report['salt_bridges'] / total_residues
+                    report['hydrophobic_sasa_norm'] = report['hydrophobic_sasa'] / total_residues
+                    
+                cmd.delete(obj_name)
+            except Exception as e:
+                logging.error(f"归一化计算失败: {str(e)}")
+          
+            # 展平氨基酸组成并收集字段
+            aa_comp = report.pop('aa_composition', {})
+            for aa in aa_comp.keys():
+                all_aa_fields.add(f'aa_{aa}')
+            for aa, val in aa_comp.items():
+                report[f'aa_{aa}'] = round(val, 4)
+              
+            reports.append(report)
+    else:
+        logging.error(f"输入路径既不是PDB文件也不是目录: {input_path}")
+        return
 
     # 合并字段到fieldnames，添加新的归一化字段
     fieldnames = [
@@ -240,7 +281,7 @@ def process_directory(input_dir):  # 移除 catalytic_residues 参数
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python protein_analyzer.py <input_dir>")  # 简化使用说明
+        print("Usage: python analyze_pdb.py <input_dir_or_file>")  # 修改使用说明
         sys.exit(1)
       
     process_directory(sys.argv[1])  # 移除第二个参数

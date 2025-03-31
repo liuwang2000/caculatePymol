@@ -1,6 +1,5 @@
-/411.pdb
-/413.pdb
-output/analyze*
-3NIY*
-4pmx*
+output/*
 output/ADQ417071_daa7d.zip
+trainData/*
+Verify/*
+models/*
