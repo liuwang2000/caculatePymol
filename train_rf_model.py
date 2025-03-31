@@ -26,6 +26,7 @@ import pathlib
 import time
 import glob
 import itertools
+from imblearn.over_sampling import SMOTE
 
 # 忽略警告
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -105,6 +106,414 @@ class StackingRegressor(BaseEstimator, RegressorMixin):
         # 使用元模型进行最终预测
         return self.meta_model_.predict(meta_features)
 
+class TemperatureRangeModel:
+    """首先判断蛋白质所属温度区间，然后使用对应区间的专用回归模型"""
+    
+    def __init__(self, temp_thresholds=[30, 70]):
+        """初始化温度分段模型
+        
+        参数:
+            temp_thresholds: 温度分段阈值，默认[30, 70]，划分为低温(<30)、中温(30-70)和高温(>70)
+        """
+        # 温度区间阈值
+        self.temp_thresholds = temp_thresholds
+        
+        # 温度区间分类器
+        from sklearn.ensemble import RandomForestClassifier
+        self.range_classifier = RandomForestClassifier(n_estimators=200, random_state=42)
+        
+        # 各温度区间的专用回归模型
+        self.models = {}
+        self.models['low'] = None     # 低温模型
+        self.models['medium'] = None  # 中温模型 
+        self.models['high'] = None    # 高温模型
+        
+        # 用于数据转换的缩放器
+        self.scaler = RobustScaler()
+        
+        # 特征名称
+        self.feature_names = None
+        
+    def fit(self, X, y, high_temp_focus=False):
+        """训练分段模型
+        
+        参数:
+            X: 特征矩阵
+            y: 温度标签
+            high_temp_focus: 是否重点优化高温区域
+        """
+        # 保存特征名称
+        self.feature_names = X.columns.tolist()
+        
+        # 应用特征缩放
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # 创建温度区间标签
+        bins = [float('-inf')] + self.temp_thresholds + [float('inf')]
+        temp_ranges = pd.cut(y, bins=bins, labels=range(len(bins)-1))
+        
+        # 训练温度区间分类器
+        logging.info("训练温度区间分类器...")
+        self.range_classifier.fit(X_scaled, temp_ranges)
+        
+        # 按温度区间分割数据
+        low_mask = y < self.temp_thresholds[0]
+        medium_mask = (y >= self.temp_thresholds[0]) & (y < self.temp_thresholds[1])
+        high_mask = y >= self.temp_thresholds[1]
+        
+        # 输出各区间样本数量
+        logging.info(f"低温区间(<{self.temp_thresholds[0]}°C)样本数: {sum(low_mask)}")
+        logging.info(f"中温区间({self.temp_thresholds[0]}-{self.temp_thresholds[1]}°C)样本数: {sum(medium_mask)}")
+        logging.info(f"高温区间(>{self.temp_thresholds[1]}°C)样本数: {sum(high_mask)}")
+        
+        # 训练低温区间模型
+        if sum(low_mask) > 10:
+            logging.info("训练低温区间模型...")
+            self.models['low'] = GradientBoostingRegressor(
+                n_estimators=150, learning_rate=0.05, max_depth=5, random_state=42
+            )
+            self.models['low'].fit(X_scaled[low_mask], y[low_mask])
+        else:
+            logging.warning(f"低温样本数量({sum(low_mask)})不足，无法训练专用模型")
+        
+        # 训练中温区间模型
+        if sum(medium_mask) > 10:
+            logging.info("训练中温区间模型...")
+            self.models['medium'] = RandomForestRegressor(
+                n_estimators=200, max_features=0.7, random_state=42
+            )
+            self.models['medium'].fit(X_scaled[medium_mask], y[medium_mask])
+        else:
+            logging.warning(f"中温样本数量({sum(medium_mask)})不足，无法训练专用模型")
+        
+        # 训练高温区间模型 - 特别优化
+        if sum(high_mask) > 5:
+            logging.info("训练高温区间模型...")
+            X_high = X_scaled[high_mask]
+            y_high = y[high_mask]
+            
+            # 如果高温样本太少且高温优化模式，进行数据增强
+            if high_temp_focus and len(X_high) < 20 and len(X_high) >= 3:
+                try:
+                    # 尝试使用SMOTE类算法增加样本
+                    sm = SMOTE(random_state=42)
+                    X_high_res, y_high_res = sm.fit_resample(X_high, y_high)
+                    logging.info(f"使用SMOTE增加高温样本: {len(X_high)} → {len(X_high_res)}")
+                except Exception as e:
+                    logging.warning(f"SMOTE采样失败: {str(e)}，使用原始样本")
+                    X_high_res, y_high_res = X_high, y_high
+            else:
+                X_high_res, y_high_res = X_high, y_high
+            
+            # 高温模型使用更保守的配置以避免过拟合
+            self.models['high'] = GradientBoostingRegressor(
+                n_estimators=100, 
+                learning_rate=0.01,
+                max_depth=3,
+                subsample=0.8,
+                random_state=42
+            )
+            self.models['high'].fit(X_high_res, y_high_res)
+        else:
+            logging.warning(f"高温样本数量({sum(high_mask)})不足，无法训练专用模型")
+        
+        return self
+    
+    def predict(self, X):
+        """使用分段模型进行预测"""
+        if not isinstance(X, pd.DataFrame):
+            # 如果输入不是DataFrame，转换为DataFrame
+            X = pd.DataFrame(X, columns=self.feature_names)
+        
+        # 应用特征缩放
+        X_scaled = self.scaler.transform(X)
+        
+        # 预测温度区间
+        predicted_ranges = self.range_classifier.predict(X_scaled)
+        
+        # 根据预测的区间使用对应的回归模型
+        predictions = np.zeros(len(X))
+        
+        for i, temp_range in enumerate(predicted_ranges):
+            if temp_range == 0 and self.models['low'] is not None:
+                # 低温区域
+                predictions[i] = self.models['low'].predict([X_scaled[i]])[0]
+            elif temp_range == 1 and self.models['medium'] is not None:
+                # 中温区域
+                predictions[i] = self.models['medium'].predict([X_scaled[i]])[0]
+            elif temp_range == 2 and self.models['high'] is not None:
+                # 高温区域
+                predictions[i] = self.models['high'].predict([X_scaled[i]])[0]
+            else:
+                # 如果没有合适的模型，使用最接近的模型
+                available_models = [model for model in self.models.values() if model is not None]
+                if available_models:
+                    # 使用最接近区间的模型
+                    if temp_range == 0 and self.models['medium'] is not None:
+                        predictions[i] = self.models['medium'].predict([X_scaled[i]])[0]
+                    elif temp_range == 1 and self.models['high'] is not None:
+                        predictions[i] = self.models['high'].predict([X_scaled[i]])[0]
+                    elif temp_range == 2 and self.models['medium'] is not None:
+                        predictions[i] = self.models['medium'].predict([X_scaled[i]])[0]
+                    else:
+                        # 使用任意可用模型
+                        predictions[i] = available_models[0].predict([X_scaled[i]])[0]
+                else:
+                    # 如果没有任何模型可用，返回样本平均值
+                    logging.error("没有可用的区间模型，返回样本平均值")
+                    predictions[i] = 50.0  # 设置一个合理的默认值
+        
+        return predictions
+
+class HighTempFocusModel:
+    """高温蛋白专精预测模型 - 简化版
+    
+    该模型采用二阶段策略：
+    1. 第一阶段：快速分类模型判断是否为高温蛋白(≥70°C)
+    2. 第二阶段：
+       - 若判断为高温蛋白，使用专门的回归模型进行精确温度预测
+       - 若判断为低温蛋白，使用简化模型给出粗略估计
+    """
+    
+    def __init__(self, temp_threshold=70):
+        """初始化高温专精模型
+        
+        参数:
+            temp_threshold: 高温阈值，默认70°C
+        """
+        self.temp_threshold = temp_threshold
+        
+        # 温度区间分类器 - 使用随机森林分类器
+        from sklearn.ensemble import RandomForestClassifier
+        self.classifier = RandomForestClassifier(
+            n_estimators=200, 
+            max_depth=None,
+            class_weight='balanced',  # 处理类别不平衡
+            random_state=42
+        )
+        
+        # 高温专精回归器 - 使用更强大的集成学习模型
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import PolynomialFeatures
+        from sklearn.svm import SVR
+        
+        # 使用核SVM作为高温预测器，处理高温区域的非线性关系
+        self.high_temp_regressor = Pipeline([
+            ('poly', PolynomialFeatures(degree=2, include_bias=False)),
+            ('svr', SVR(kernel='rbf', C=100, gamma='auto'))
+        ])
+        
+        # 低温简化回归器 - 使用简单的随机森林
+        self.low_temp_regressor = RandomForestRegressor(
+            n_estimators=50,  # 进一步简化低温模型
+            max_depth=10,     # 限制树深度，防止过拟合
+            random_state=42
+        )
+        
+        # 特征标准化器
+        self.scaler = StandardScaler()
+        
+        # 特征名列表
+        self.feature_names = None
+        
+        # 热稳定性特征的重要性权重
+        self.thermo_features_weight = 2.5  # 增加热稳定性特征的权重，优化高温预测
+    
+    def fit(self, X, y, synthetic_samples=True, n_synthetic=50):
+        """训练高温专精模型
+        
+        参数:
+            X: 特征矩阵
+            y: 温度标签
+            synthetic_samples: 是否生成合成高温样本
+            n_synthetic: 生成的合成样本数量
+        """
+        # 保存特征名称
+        self.feature_names = X.columns.tolist()
+        
+        # 识别热稳定性特征列
+        thermo_features = [col for col in self.feature_names if col in [
+            'ion_pair_density', 'core_residue_ratio', 'surface_charge_ratio', 
+            'ivywrel_index', 'dense_hbond_network', 'compactness_index',
+            'helix_sheet_ratio', 'aromatic_interactions', 'glycine_content'
+        ]]
+        
+        # 增强热稳定性特征的权重
+        X_weighted = X.copy()
+        if thermo_features:
+            logging.info(f"找到{len(thermo_features)}个热稳定性特征，增强其权重")
+            for feature in thermo_features:
+                X_weighted[feature] = X[feature] * self.thermo_features_weight
+        
+        # 应用特征缩放
+        X_scaled = self.scaler.fit_transform(X_weighted)
+        
+        # 创建温度区间标签 (0表示低温区，1表示高温区)
+        temp_classes = (y >= self.temp_threshold).astype(int)
+        
+        # 输出各温度区间样本数量
+        high_count = sum(temp_classes)
+        low_count = len(temp_classes) - high_count
+        logging.info(f"低温区间(<{self.temp_threshold}°C)样本数: {low_count}")
+        logging.info(f"高温区间(≥{self.temp_threshold}°C)样本数: {high_count}")
+        
+        # 生成合成高温样本（如需要）
+        if synthetic_samples and high_count > 2 and high_count < low_count:
+            X_aug, y_aug = self._generate_synthetic_samples(
+                X_weighted, y, self.temp_threshold, n_synthetic
+            )
+            X_scaled_aug = self.scaler.transform(X_aug)
+            temp_classes_aug = (y_aug >= self.temp_threshold).astype(int)
+            
+            # 记录增强后的样本数
+            high_count_aug = sum(temp_classes_aug)
+            logging.info(f"合成后高温样本数: {high_count_aug}")
+        else:
+            X_scaled_aug = X_scaled
+            y_aug = y
+            temp_classes_aug = temp_classes
+        
+        # 训练温度区间分类器
+        logging.info("训练温度区间分类器...")
+        self.classifier.fit(X_scaled_aug, temp_classes_aug)
+        
+        # 预测准确率评估
+        train_pred_class = self.classifier.predict(X_scaled)
+        accuracy = np.mean(train_pred_class == temp_classes)
+        logging.info(f"温度区间分类器准确率: {accuracy:.2f}")
+        
+        # 分别训练高温和低温回归器
+        high_mask = y >= self.temp_threshold
+        if sum(high_mask) > 5:
+            logging.info("训练高温专精回归器...")
+            
+            # 对高温样本进行加权，关注关键特征
+            high_X = X_scaled[high_mask]
+            high_y = y[high_mask]
+            
+            # 使用SVR回归器进行高温专精预测
+            self.high_temp_regressor.fit(high_X, high_y)
+            
+            # 评估高温回归器的训练性能
+            high_preds = self.high_temp_regressor.predict(high_X)
+            high_rmse = np.sqrt(mean_squared_error(high_y, high_preds))
+            high_r2 = r2_score(high_y, high_preds)
+            logging.info(f"高温回归器训练性能: RMSE={high_rmse:.2f}, R²={high_r2:.2f}")
+            
+        else:
+            logging.warning(f"高温样本数量({sum(high_mask)})不足，无法训练专用高温回归器")
+        
+        # 训练低温回归器（这里只是为了兼容性，精度要求不高）
+        low_mask = ~high_mask
+        if sum(low_mask) > 5:
+            logging.info("训练低温简化回归器...")
+            self.low_temp_regressor.fit(X_scaled[low_mask], y[low_mask])
+        else:
+            logging.warning(f"低温样本数量({sum(low_mask)})不足，无法训练低温回归器")
+        
+        return self
+    
+    def predict(self, X):
+        """使用高温专精模型进行预测"""
+        if not isinstance(X, pd.DataFrame):
+            # 如果输入不是DataFrame，转换为DataFrame
+            X = pd.DataFrame(X, columns=self.feature_names)
+        
+        # 检查缺失的特征并填充
+        for col in self.feature_names:
+            if col not in X.columns:
+                logging.warning(f"输入数据中缺少特征: {col}，填充为0")
+                X[col] = 0.0
+        
+        # 使用与训练相同的热稳定性特征增强逻辑
+        X_weighted = X.copy()
+        thermo_features = [col for col in self.feature_names if col in [
+            'ion_pair_density', 'core_residue_ratio', 'surface_charge_ratio', 
+            'ivywrel_index', 'dense_hbond_network', 'compactness_index',
+            'helix_sheet_ratio', 'aromatic_interactions', 'glycine_content'
+        ]]
+        
+        if thermo_features:
+            for feature in thermo_features:
+                if feature in X.columns:
+                    X_weighted[feature] = X[feature] * self.thermo_features_weight
+        
+        # 应用特征缩放
+        X_scaled = self.scaler.transform(X_weighted[self.feature_names])
+        
+        # 预测温度区间
+        is_high_temp = self.classifier.predict(X_scaled)
+        
+        # 初始化预测结果
+        predictions = np.zeros(len(X))
+        
+        # 对每个样本使用适当的回归器
+        for i, is_high in enumerate(is_high_temp):
+            if is_high:
+                # 高温区域，使用高温专精回归器
+                if hasattr(self.high_temp_regressor, 'predict'):
+                    predictions[i] = self.high_temp_regressor.predict([X_scaled[i]])[0]
+                else:
+                    # 降级到简单预测
+                    predictions[i] = self.temp_threshold + 10.0
+            else:
+                # 低温区域，使用简化预测
+                if hasattr(self.low_temp_regressor, 'predict'):
+                    predictions[i] = self.low_temp_regressor.predict([X_scaled[i]])[0]
+                else:
+                    # 无可用回归器，使用简单估计值
+                    predictions[i] = self.temp_threshold * 0.7
+        
+        return predictions
+    
+    def _generate_synthetic_samples(self, X, y, temp_threshold, n_samples):
+        """为高温区间生成合成样本"""
+        logging.info(f"生成高温合成样本，目标样本数={n_samples}")
+        
+        # 筛选高温样本
+        high_temp_mask = y >= temp_threshold
+        high_temp_X = X[high_temp_mask].copy()
+        high_temp_y = y[high_temp_mask].copy()
+        
+        high_temp_count = len(high_temp_X)
+        if high_temp_count < 3:
+            logging.warning(f"高温样本数量({high_temp_count})不足，无法生成合成样本")
+            return X, y
+        
+        # 生成合成样本
+        synthetic_X_list = []
+        synthetic_y_list = []
+        
+        for _ in range(n_samples):
+            # 随机选择两个高温样本
+            idx1, idx2 = np.random.choice(high_temp_count, 2, replace=False)
+            
+            # 生成随机插值系数
+            alpha = np.random.random()
+            
+            # 线性插值生成新样本
+            new_X = high_temp_X.iloc[idx1] * alpha + high_temp_X.iloc[idx2] * (1-alpha)
+            new_y = high_temp_y.iloc[idx1] * alpha + high_temp_y.iloc[idx2] * (1-alpha)
+            
+            # 加入微小扰动以增加多样性
+            perturbation = np.random.normal(0, 0.01, size=len(new_X))
+            new_X = new_X + pd.Series(perturbation, index=new_X.index)
+            
+            synthetic_X_list.append(new_X)
+            synthetic_y_list.append(new_y)
+        
+        # 转换为DataFrame和Series
+        synthetic_X = pd.DataFrame(synthetic_X_list, columns=X.columns)
+        synthetic_y = pd.Series(synthetic_y_list)
+        
+        # 合并原始数据和合成数据
+        X_combined = pd.concat([X, synthetic_X], ignore_index=True)
+        y_combined = pd.concat([y, synthetic_y], ignore_index=True)
+        
+        logging.info(f"合成样本生成完成，高温样本数量: {sum(y_combined >= temp_threshold)}")
+        
+        return X_combined, y_combined
+
 def load_data(data_file):
     """加载训练数据"""
     logging.info(f"从{data_file}加载数据")
@@ -122,6 +531,93 @@ def load_data(data_file):
     except Exception as e:
         logging.error(f"加载数据失败: {str(e)}")
         raise
+
+def temperature_weighted_sampling(X, y, temp_threshold=70, weight_factor=3):
+    """为高温样本增加权重，用于训练时平衡不同温度区间样本的影响
+    
+    参数:
+        X: 特征矩阵
+        y: 温度标签
+        temp_threshold: 高温阈值，默认70°C
+        weight_factor: 高温样本权重系数，默认3.0
+        
+    返回:
+        样本权重数组
+    """
+    logging.info(f"应用温度加权采样，温度阈值={temp_threshold}°C，权重系数={weight_factor}")
+    sample_weights = np.ones(len(y))
+    high_temp_mask = y >= temp_threshold
+    sample_weights[high_temp_mask] = weight_factor
+    
+    # 温度统计
+    high_temp_count = sum(high_temp_mask)
+    total_count = len(y)
+    logging.info(f"高温样本占比: {high_temp_count}/{total_count} ({high_temp_count/total_count*100:.1f}%)")
+    
+    return sample_weights
+
+def generate_synthetic_high_temp_samples(X, y, temp_threshold=70, n_samples=50):
+    """为高温区间生成合成样本，缓解样本不平衡问题
+    
+    参数:
+        X: 特征矩阵
+        y: 温度标签
+        temp_threshold: 高温阈值，默认70°C
+        n_samples: 要生成的合成样本数量
+        
+    返回:
+        增强后的特征矩阵和标签
+    """
+    logging.info(f"生成高温合成样本，温度阈值={temp_threshold}°C，目标样本数={n_samples}")
+    
+    # 定位高温样本
+    high_temp_indices = np.where(y >= temp_threshold)[0]
+    high_temp_count = len(high_temp_indices)
+    
+    if high_temp_count < 3:
+        logging.warning(f"高温样本数量({high_temp_count})不足，无法生成合成样本")
+        return X, y
+        
+    logging.info(f"原始高温样本数量: {high_temp_count}")
+    
+    # 提取高温样本
+    high_temp_X = X.iloc[high_temp_indices].copy()
+    high_temp_y = y.iloc[high_temp_indices].copy()
+    
+    # 生成合成样本
+    synthetic_X_list = []
+    synthetic_y_list = []
+    
+    for _ in range(n_samples):
+        # 随机选择两个高温样本
+        idx1, idx2 = np.random.choice(high_temp_count, 2, replace=False)
+        
+        # 生成随机插值系数
+        alpha = np.random.random()
+        
+        # 线性插值生成新样本
+        new_X = high_temp_X.iloc[idx1] * alpha + high_temp_X.iloc[idx2] * (1-alpha)
+        new_y = high_temp_y.iloc[idx1] * alpha + high_temp_y.iloc[idx2] * (1-alpha)
+        
+        # 加入微小扰动以增加多样性
+        perturbation = np.random.normal(0, 0.01, size=len(new_X))
+        new_X = new_X + pd.Series(perturbation, index=new_X.index)
+        
+        synthetic_X_list.append(new_X)
+        synthetic_y_list.append(new_y)
+    
+    # 转换为DataFrame和Series
+    synthetic_X = pd.DataFrame(synthetic_X_list, columns=X.columns)
+    synthetic_y = pd.Series(synthetic_y_list)
+    
+    # 合并原始数据和合成数据
+    X_combined = pd.concat([X, synthetic_X], ignore_index=True)
+    y_combined = pd.concat([y, synthetic_y], ignore_index=True)
+    
+    logging.info(f"合成样本生成完成，最终高温样本数量: {sum(y_combined >= temp_threshold)}")
+    logging.info(f"数据集扩充: {len(X)} → {len(X_combined)} 个样本")
+    
+    return X_combined, y_combined
 
 def create_interaction_features(X, top_n=10):
     """创建特征交互项"""
@@ -473,7 +969,7 @@ def cross_validate_model(X, y, n_splits=5):
     
     return rmse_scores.mean(), mae_scores.mean(), r2_scores.mean()
 
-def train_model(X, y, output_dir=None, use_advanced_models=False):
+def train_model(X, y, output_dir=None, use_advanced_models=False, sample_weights=None):
     """训练模型"""
     # 分割训练集和测试集 - 使用分层抽样
     try:
@@ -486,12 +982,23 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
         for train_idx, test_idx in split.split(X, y_bins):
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            if sample_weights is not None:
+                # 提取训练样本的权重
+                train_weights = sample_weights[train_idx]
+                logging.info(f"使用样本权重进行训练，权重范围: {train_weights.min():.2f}-{train_weights.max():.2f}")
+            else:
+                train_weights = None
         
         logging.info("使用分层抽样分割数据集")
     except Exception as e:
         # 如果分层抽样失败，使用传统方法
         logging.warning(f"分层抽样失败: {e}，使用传统方法")
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        if sample_weights is not None:
+            # 提取训练样本的权重
+            train_weights = sample_weights[X_train.index]
+        else:
+            train_weights = None
     
     logging.info(f"训练集大小: {len(X_train)}, 测试集大小: {len(X_test)}")
     logging.info(f"训练集温度范围: {y_train.min():.1f}°C - {y_train.max():.1f}°C")
@@ -504,7 +1011,7 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
     
     # 创建并训练基础随机森林模型
     rf_model = RandomForestRegressor(n_estimators=150, random_state=42)
-    rf_model.fit(X_train_scaled, y_train)
+    rf_model.fit(X_train_scaled, y_train, sample_weight=train_weights)
     logging.info("基础随机森林模型训练完成")
     
     # 模型评估
@@ -539,7 +1046,12 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
         scoring='neg_mean_squared_error'
     )
     
-    grid_search.fit(X_train_scaled, y_train)
+    # 使用样本权重拟合
+    if train_weights is not None:
+        grid_search.fit(X_train_scaled, y_train, sample_weight=train_weights)
+    else:
+        grid_search.fit(X_train_scaled, y_train)
+    
     logging.info(f"最佳参数: {grid_search.best_params_}")
     
     # 使用最佳参数训练最终模型
@@ -547,7 +1059,13 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
         **grid_search.best_params_,
         random_state=42
     )
-    best_rf_model.fit(X_train_scaled, y_train)
+    
+    # 使用样本权重拟合最终模型
+    if train_weights is not None:
+        best_rf_model.fit(X_train_scaled, y_train, sample_weight=train_weights)
+    else:
+        best_rf_model.fit(X_train_scaled, y_train)
+        
     logging.info("优化后的随机森林模型训练完成")
     
     # 评估最终模型
@@ -586,11 +1104,21 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
         scoring='neg_mean_squared_error'
     )
     
-    grid_search_gb.fit(X_train_scaled, y_train)
+    # 使用样本权重拟合梯度提升模型网格搜索
+    if train_weights is not None:
+        grid_search_gb.fit(X_train_scaled, y_train, sample_weight=train_weights)
+    else:
+        grid_search_gb.fit(X_train_scaled, y_train)
+        
     logging.info(f"梯度提升最佳参数: {grid_search_gb.best_params_}")
     
     gb_model = GradientBoostingRegressor(**grid_search_gb.best_params_, random_state=42)
-    gb_model.fit(X_train_scaled, y_train)
+    
+    # 使用样本权重拟合梯度提升模型
+    if train_weights is not None:
+        gb_model.fit(X_train_scaled, y_train, sample_weight=train_weights)
+    else:
+        gb_model.fit(X_train_scaled, y_train)
     
     gb_test_pred = gb_model.predict(X_test_scaled)
     gb_test_rmse = np.sqrt(mean_squared_error(y_test, gb_test_pred))
@@ -812,7 +1340,7 @@ def process_directory(directory_path, model_path, output_dir=None):
     if not analyze_files:
         logging.warning("未找到任何现有分析文件，将运行 analyze_pdb.py")
         # 直接调用analyze_pdb.py处理整个目录
-        cmd = ['python', 'analyze_pdb.py', directory_path]
+        cmd = ['python', 'analyze_pdb.py', directory_path, '--thermostability']
         logging.info(f"执行命令: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         
@@ -857,7 +1385,6 @@ def process_directory(directory_path, model_path, output_dir=None):
         logging.info(f"已加载模型包: {model_path}")
         
         model = model_package['model']
-        scaler = model_package['scaler']
         feature_names = model_package['feature_names']
         model_type = model_package.get('model_type', '未知')
         
@@ -877,11 +1404,8 @@ def process_directory(directory_path, model_path, output_dir=None):
             logging.warning("特征中存在NaN值，将进行填充")
             X = X.fillna(X.mean())
         
-        # 应用特征标准化
-        X_scaled = scaler.transform(X)
-        
-        # 预测
-        predictions = model.predict(X_scaled)
+        # 直接使用高温专精模型进行预测，无需额外的缩放
+        predictions = model.predict(X)
         
         # 添加预测结果到DataFrame
         pdb_data['predicted_temperature'] = predictions
@@ -898,7 +1422,10 @@ def process_directory(directory_path, model_path, output_dir=None):
         
         # 打印每个PDB文件的预测结果
         for index, row in pdb_data.iterrows():
-            logging.info(f"预测结果 - {row['pdb_id']}: {row['predicted_temperature']:.2f}°C")
+            # 检查是否为高温蛋白
+            is_high_temp = row['predicted_temperature'] >= 70
+            temp_indicator = "【高温】" if is_high_temp else "【低温】"
+            logging.info(f"预测结果 - {row['pdb_id']}: {row['predicted_temperature']:.2f}°C {temp_indicator}")
         
         return True
     except Exception as e:
@@ -927,7 +1454,94 @@ def parse_args():
                       help='使用特征交互')
     parser.add_argument('--nonlinear', action='store_true',
                       help='应用非线性特征变换')
+    # 添加高温酶优化相关选项
+    parser.add_argument('--segmented_model', action='store_true',
+                      help='使用分段模型（为不同温度区间训练专用模型）')
+    parser.add_argument('--high_temp_focus', action='store_true',
+                      help='专注于优化高温区域的预测精度')
+    parser.add_argument('--high_temp_specialist', action='store_true',
+                      help='使用高温专精模型，对高温蛋白进行精确预测')
+    parser.add_argument('--temperature_threshold', type=float, default=70.0,
+                      help='定义高温区域的温度阈值（默认70°C）')
+    parser.add_argument('--high_temp_weight', type=float, default=3.0,
+                      help='高温样本权重系数（默认3.0）')
+    parser.add_argument('--synthetic_samples', action='store_true',
+                      help='为稀有温度区域生成合成样本')
     return parser.parse_args()
+
+def evaluate_high_temperature_performance(y_true, y_pred, high_temp_threshold=70):
+    """评估模型在高温区域的表现"""
+    # 筛选高温样本
+    high_temp_mask = y_true >= high_temp_threshold
+    high_temp_y_true = y_true[high_temp_mask]
+    high_temp_y_pred = y_pred[high_temp_mask]
+    
+    if len(high_temp_y_true) == 0:
+        return {"error": "没有高温样本可供评估"}
+    
+    # 计算高温区域的评估指标
+    high_temp_metrics = {
+        "高温样本数量": len(high_temp_y_true),
+        "高温平均真实值": float(np.mean(high_temp_y_true)),
+        "高温平均预测值": float(np.mean(high_temp_y_pred)),
+        "高温RMSE": float(np.sqrt(mean_squared_error(high_temp_y_true, high_temp_y_pred))),
+        "高温MAE": float(mean_absolute_error(high_temp_y_true, high_temp_y_pred)),
+        "高温R²": float(r2_score(high_temp_y_true, high_temp_y_pred)) if len(high_temp_y_true) > 2 else "样本不足",
+        "高温相对误差": float(np.mean(np.abs((high_temp_y_true - high_temp_y_pred) / high_temp_y_true)) * 100)
+    }
+    
+    logging.info(f"高温区域(≥{high_temp_threshold}°C)评估结果:")
+    for metric, value in high_temp_metrics.items():
+        logging.info(f"  {metric}: {value}")
+    
+    return high_temp_metrics
+
+def plot_high_temp_performance(y_true, y_pred, output_dir, threshold=70):
+    """可视化模型在高温区域的表现"""
+    plt.figure(figsize=(12, 8))
+    
+    # 划分温度区间
+    low_mask = y_true < threshold
+    high_mask = y_true >= threshold
+    
+    # 绘制低温区间预测
+    plt.scatter(y_true[low_mask], y_pred[low_mask], 
+                alpha=0.6, c='blue', label=f'<{threshold}°C')
+    
+    # 突出显示高温区间预测
+    plt.scatter(y_true[high_mask], y_pred[high_mask], 
+                alpha=0.8, c='red', s=80, label=f'≥{threshold}°C')
+    
+    # 添加理想预测线
+    min_val = min(min(y_true), min(y_pred))
+    max_val = max(max(y_true), max(y_pred))
+    plt.plot([min_val, max_val], [min_val, max_val], 'k--')
+    
+    # 计算并显示高温区域指标
+    if sum(high_mask) > 0:
+        high_rmse = np.sqrt(mean_squared_error(y_true[high_mask], y_pred[high_mask]))
+        high_r2 = r2_score(y_true[high_mask], y_pred[high_mask]) if sum(high_mask) > 2 else float('nan')
+        
+        # 修复格式化字符串错误
+        r2_text = f"{high_r2:.2f}" if not np.isnan(high_r2) else "N/A"
+        
+        plt.text(min_val + 0.05*(max_val-min_val), 
+                max_val - 0.1*(max_val-min_val),
+                f'高温区域 (≥{threshold}°C):\nRMSE = {high_rmse:.2f}\nR² = {r2_text}',
+                bbox=dict(facecolor='red', alpha=0.2))
+    
+    plt.xlabel('真实最适温度 (°C)')
+    plt.ylabel('预测最适温度 (°C)')
+    plt.title('高温区域预测性能评估')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    
+    # 保存图片
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, 'high_temp_performance.png')
+    plt.savefig(plot_path)
+    logging.info(f"高温区域性能图已保存至: {plot_path}")
+    plt.close()
 
 if __name__ == "__main__":
     # 设置中文字体支持
@@ -965,6 +1579,16 @@ if __name__ == "__main__":
             # 加载数据
             data = load_data(args.data)
             
+            # 如果开启高温优化模式，打印温度分布统计信息
+            if args.high_temp_focus or args.high_temp_specialist:
+                temp_threshold = args.temperature_threshold
+                high_temp_count = sum(data['optimal_temperature'] >= temp_threshold)
+                total_count = len(data)
+                logging.info(f"数据集温度分布统计:")
+                logging.info(f"  总样本数: {total_count}")
+                logging.info(f"  高温样本数(≥{temp_threshold}°C): {high_temp_count} ({high_temp_count/total_count*100:.1f}%)")
+                logging.info(f"  中低温样本数(<{temp_threshold}°C): {total_count - high_temp_count} ({(total_count - high_temp_count)/total_count*100:.1f}%)")
+            
             # 准备特征
             X, y, feature_cols = prepare_features(
                 data, 
@@ -974,16 +1598,158 @@ if __name__ == "__main__":
             )
             logging.info(f"使用{len(feature_cols)}个特征进行训练")
             
+            # 如果启用合成样本生成
+            if args.synthetic_samples and args.high_temp_focus:
+                X, y = generate_synthetic_high_temp_samples(
+                    X, y, temp_threshold=args.temperature_threshold, n_samples=50
+                )
+            
             # 执行交叉验证评估
             cv_rmse, cv_mae, cv_r2 = cross_validate_model(X, y)
             
-            # 训练模型
-            model, X_test, y_test, y_pred, model_type = train_model(
-                X, y, args.output, use_advanced_models=args.advanced_models
-            )
+            # 高温专精模型训练
+            if args.high_temp_specialist:
+                logging.info("使用高温专精模型训练...")
+                # 分割训练集和测试集
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.2, random_state=42, stratify=pd.cut(y, bins=5, labels=False)
+                )
+                
+                # 创建并训练高温专精模型
+                specialist_model = HighTempFocusModel(
+                    temp_threshold=args.temperature_threshold
+                )
+                
+                # 训练模型
+                specialist_model.fit(
+                    X_train, y_train, 
+                    synthetic_samples=args.synthetic_samples, 
+                    n_synthetic=50
+                )
+                
+                # 预测
+                y_pred = specialist_model.predict(X_test)
+                
+                # 整体评估
+                rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+                r2 = r2_score(y_test, y_pred)
+                
+                logging.info(f"高温专精模型 - 整体测试集 RMSE: {rmse:.2f}, R²: {r2:.2f}")
+                
+                # 高温区域评估
+                high_temp_metrics = evaluate_high_temperature_performance(
+                    y_test, y_pred, high_temp_threshold=args.temperature_threshold
+                )
+                
+                # 绘制高温区域性能图
+                if os.path.exists(args.output):
+                    plot_high_temp_performance(
+                        y_test, y_pred, args.output, threshold=args.temperature_threshold
+                    )
+                
+                # 保存模型
+                model_path = os.path.join(args.output, 'temperature_predictor.joblib')
+                model_package = {
+                    'model': specialist_model,
+                    'feature_names': X.columns.tolist(),
+                    'model_type': '高温专精模型',
+                    'performance': {
+                        'rmse': rmse,
+                        'r2': r2,
+                        'high_temp_metrics': high_temp_metrics
+                    }
+                }
+                joblib.dump(model_package, model_path)
+                logging.info(f"高温专精模型已保存至: {model_path}")
+
+                # 生成预测vs实际值对比图
+                plot_predictions(y_test, y_pred, args.output)
+                
+                # 创建残差图
+                plot_residuals(y_test, y_pred, args.output)
+                
+            elif args.segmented_model:
+                # 使用原有的分段模型训练逻辑
+                # ... 此处保留原有代码 ...
+                logging.info("使用分段模型训练...")
+                # 创建分段模型
+                segmented_model = TemperatureRangeModel(
+                    temp_thresholds=[30, args.temperature_threshold]
+                )
+                
+                # 分割训练集和测试集
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.2, random_state=42, stratify=pd.cut(y, bins=5, labels=False)
+                )
+                
+                # 训练分段模型
+                segmented_model.fit(X_train, y_train, high_temp_focus=args.high_temp_focus)
+                
+                # 预测
+                y_pred = segmented_model.predict(X_test)
+                
+                # 评估
+                rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+                r2 = r2_score(y_test, y_pred)
+                
+                logging.info(f"分段模型 - 测试集总体 RMSE: {rmse:.2f}, R²: {r2:.2f}")
+                
+                # 评估高温区域性能
+                high_temp_metrics = evaluate_high_temperature_performance(
+                    y_test, y_pred, high_temp_threshold=args.temperature_threshold
+                )
+                
+                # 绘制高温区域性能图
+                if os.path.exists(args.output):
+                    plot_high_temp_performance(
+                        y_test, y_pred, args.output, threshold=args.temperature_threshold
+                    )
+                
+                # 保存模型
+                model_path = os.path.join(args.output, 'temperature_predictor.joblib')
+                model_package = {
+                    'model': segmented_model,
+                    'feature_names': X.columns.tolist(),
+                    'model_type': '分段模型',
+                    'performance': {
+                        'rmse': rmse,
+                        'r2': r2,
+                        'high_temp_metrics': high_temp_metrics
+                    }
+                }
+                joblib.dump(model_package, model_path)
+                logging.info(f"分段模型已保存至: {model_path}")
+                
+            else:
+                # 标准模型训练
+                # ... 此处保留原有代码 ...
+                # 如果开启高温样本加权
+                sample_weights = None
+                if args.high_temp_focus:
+                    sample_weights = temperature_weighted_sampling(
+                        X, y, temp_threshold=args.temperature_threshold, weight_factor=args.high_temp_weight
+                    )
+                
+                # 训练模型
+                model, X_test, y_test, y_pred, model_type = train_model(
+                    X, y, args.output, use_advanced_models=args.advanced_models, sample_weights=sample_weights
+                )
+                
+                # 评估高温区域性能
+                high_temp_metrics = evaluate_high_temperature_performance(
+                    y_test, y_pred, high_temp_threshold=args.temperature_threshold
+                )
+                
+                # 绘制高温区域性能图
+                if os.path.exists(args.output):
+                    plot_high_temp_performance(
+                        y_test, y_pred, args.output, threshold=args.temperature_threshold
+                    )
             
             logging.info("训练完成！模型可用于预测新的PDB文件的最适温度")
-            logging.info(f"交叉验证RMSE: {cv_rmse:.2f}, 最终模型: {model_type}, 测试集R²: {r2_score(y_test, y_pred):.2f}")
+            model_type_name = "高温专精模型" if args.high_temp_specialist else ("分段模型" if args.segmented_model else model_type)
+            logging.info(f"交叉验证RMSE: {cv_rmse:.2f}, 最终模型类型: {model_type_name}")
+            
         except Exception as e:
             logging.error(f"训练过程中出错: {str(e)}")
             import traceback
