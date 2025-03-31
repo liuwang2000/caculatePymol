@@ -189,8 +189,28 @@ def process_directory(input_dir):  # 移除 catalytic_residues 参数
       
         # 提取特征
         report = {'pdb_id': pdb_id}
-        report.update(analyze_pdb_features(pdb_path))  # 参数数量已改变
+        report.update(analyze_pdb_features(pdb_path))
         report.update(extract_biopython_features(pdb_path))
+        
+        # 计算蛋白质中的氨基酸总数
+        try:
+            cmd.reinitialize()
+            obj_name = os.path.splitext(os.path.basename(pdb_path))[0]
+            cmd.load(pdb_path, obj_name)
+            total_residues = cmd.count_atoms(f"{obj_name} and name ca")
+            
+            # 归一化相关指标
+            if total_residues > 0:
+                report['hydrogen_bonds_norm'] = report['hydrogen_bonds'] / total_residues
+                report['hydrophobic_contacts_norm'] = report['hydrophobic_contacts'] / total_residues
+                report['salt_bridges_norm'] = report['salt_bridges'] / total_residues
+                report['hydrophobic_sasa_norm'] = report['hydrophobic_sasa'] / total_residues
+                # mean_sasa已经是平均值，但如果需要按所有氨基酸平均：
+                # report['mean_sasa_all'] = report['hydrophobic_sasa'] / total_residues
+            
+            cmd.delete(obj_name)
+        except Exception as e:
+            logging.error(f"归一化计算失败: {str(e)}")
       
         # 展平氨基酸组成并收集字段
         aa_comp = report.pop('aa_composition', {})
@@ -201,12 +221,11 @@ def process_directory(input_dir):  # 移除 catalytic_residues 参数
           
         reports.append(report)
 
-    # 合并字段到fieldnames
-    # 修改 fieldnames 列表（移除 catalytic_distance）
+    # 合并字段到fieldnames，添加新的归一化字段
     fieldnames = [
-        'pdb_id', 'disulfide_bonds', 'surface_polar_ratio', 'hydrogen_bonds',
-        'hydrophobic_contacts', 'salt_bridges',  # 已移除 catalytic_distance
-        'hydrophobic_sasa', 'mean_sasa', 'helix', 'sheet', 'loop'
+        'pdb_id', 'disulfide_bonds', 'surface_polar_ratio', 'hydrogen_bonds', 'hydrogen_bonds_norm',
+        'hydrophobic_contacts', 'hydrophobic_contacts_norm', 'salt_bridges', 'salt_bridges_norm',
+        'hydrophobic_sasa', 'hydrophobic_sasa_norm', 'mean_sasa', 'helix', 'sheet', 'loop'
     ] + sorted(all_aa_fields)
 
     with open(output_csv, 'w', newline='') as csvfile:
