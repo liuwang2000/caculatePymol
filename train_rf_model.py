@@ -8,18 +8,27 @@ import joblib
 import argparse
 import logging
 import subprocess
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import warnings
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, KFold
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.feature_selection import SelectFromModel, RFECV
+from sklearn.preprocessing import StandardScaler, RobustScaler, PolynomialFeatures
+from sklearn.feature_selection import SelectFromModel, RFECV, mutual_info_regression
 from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, RegressorMixin
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import sys
 import pathlib
 import time
 import glob
+import itertools
+
+# 忽略警告
+warnings.filterwarnings('ignore', category=UserWarning)
 
 # 配置中文字体支持
 def setup_chinese_font():
@@ -49,6 +58,53 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# 堆叠模型实现
+class StackingRegressor(BaseEstimator, RegressorMixin):
+    """自定义堆叠回归器"""
+    def __init__(self, base_models, meta_model, n_folds=5):
+        self.base_models = base_models
+        self.meta_model = meta_model
+        self.n_folds = n_folds
+        self.base_models_ = None
+        self.meta_model_ = None
+        self.kfold = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+        
+    def fit(self, X, y):
+        self.base_models_ = [list() for _ in range(len(self.base_models))]
+        
+        # 存储每个模型的预测结果的OOF (Out-of-Fold)
+        oof_predictions = np.zeros((X.shape[0], len(self.base_models)))
+        
+        # 训练基础模型
+        for i, model in enumerate(self.base_models):
+            logging.info(f"训练基础模型 {i+1}/{len(self.base_models)}: {type(model).__name__}")
+            for train_idx, valid_idx in self.kfold.split(X):
+                X_train_fold, X_valid_fold = X[train_idx], X[valid_idx]
+                y_train_fold, y_valid_fold = y[train_idx], y[valid_idx]
+                
+                # 训练模型
+                model_fold = model.fit(X_train_fold, y_train_fold)
+                self.base_models_[i].append(model_fold)
+                
+                # 存储预测结果
+                oof_predictions[valid_idx, i] = model_fold.predict(X_valid_fold)
+        
+        # 训练元模型
+        logging.info(f"训练元模型: {type(self.meta_model).__name__}")
+        self.meta_model_ = self.meta_model.fit(oof_predictions, y)
+        
+        return self
+    
+    def predict(self, X):
+        # 获取基础模型的预测结果
+        meta_features = np.column_stack([
+            np.mean([model.predict(X) for model in models], axis=0)
+            for models in self.base_models_
+        ])
+        
+        # 使用元模型进行最终预测
+        return self.meta_model_.predict(meta_features)
+
 def load_data(data_file):
     """加载训练数据"""
     logging.info(f"从{data_file}加载数据")
@@ -67,7 +123,77 @@ def load_data(data_file):
         logging.error(f"加载数据失败: {str(e)}")
         raise
 
-def prepare_features(data, apply_feature_selection=True):
+def create_interaction_features(X, top_n=10):
+    """创建特征交互项"""
+    logging.info("创建特征交互项...")
+    feature_names = X.columns.tolist()
+    
+    # 计算原始特征的重要性
+    y = X[feature_names[0]].values  # 临时使用第一列作为目标变量
+    mi_scores = mutual_info_regression(X, y, random_state=42)
+    
+    # 选择重要性排名靠前的特征
+    important_indices = np.argsort(mi_scores)[-top_n:]
+    important_features = [feature_names[i] for i in important_indices]
+    
+    # 创建交互特征
+    interaction_features = pd.DataFrame(index=X.index)
+    
+    # 所有重要特征的两两组合
+    for f1, f2 in itertools.combinations(important_features, 2):
+        if f1 != f2:
+            # 创建交互项
+            interaction_name = f"{f1}_x_{f2}"
+            interaction_features[interaction_name] = X[f1] * X[f2]
+    
+    # 只保留变化足够的交互特征
+    final_interactions = pd.DataFrame(index=X.index)
+    cols_added = 0
+    
+    for col in interaction_features.columns:
+        if interaction_features[col].std() > 0:  # 确保特征有变化
+            final_interactions[col] = interaction_features[col]
+            cols_added += 1
+            if cols_added >= 15:  # 限制添加的特征数量
+                break
+    
+    logging.info(f"创建了{cols_added}个交互特征")
+    return pd.concat([X, final_interactions], axis=1)
+
+def apply_nonlinear_transform(X):
+    """应用非线性特征变换"""
+    logging.info("应用非线性特征变换...")
+    X_transformed = X.copy()
+    
+    # 默认变换：对适合的特征应用对数、平方、平方根变换
+    for col in X.columns:
+        # 确保特征都是正数才应用对数变换
+        if X[col].min() > 0:
+            # 对数变换
+            X_transformed[f"{col}_log"] = np.log1p(X[col])
+            
+            # 平方根变换
+            X_transformed[f"{col}_sqrt"] = np.sqrt(X[col])
+        
+        # 平方变换
+        X_transformed[f"{col}_squared"] = X[col] ** 2
+    
+    # 添加多项式特征（2次）- 只对前5个特征应用以避免维度爆炸
+    if len(X.columns) > 5:
+        top_cols = X.columns[:5]
+        poly = PolynomialFeatures(2, interaction_only=True, include_bias=False)
+        poly_features = poly.fit_transform(X[top_cols])
+        feature_names = poly.get_feature_names_out(top_cols)
+        
+        # 添加多项式特征
+        for i, name in enumerate(feature_names):
+            if i >= len(top_cols):  # 跳过原始特征
+                X_transformed[name] = poly_features[:, i]
+    
+    logging.info(f"非线性变换后的特征数量: {X_transformed.shape[1]}")
+    return X_transformed
+
+def prepare_features(data, apply_feature_selection=True, use_interaction=False, use_nonlinear=False):
     """准备特征数据和目标变量"""
     # 排除不作为特征的列
     exclude_columns = [
@@ -85,6 +211,14 @@ def prepare_features(data, apply_feature_selection=True):
         logging.warning(f"特征中存在NaN值，将进行填充")
         X = X.fillna(X.mean())
     
+    # 应用非线性特征变换
+    if use_nonlinear:
+        X = apply_nonlinear_transform(X)
+    
+    # 添加特征交互项
+    if use_interaction:
+        X = create_interaction_features(X)
+    
     # 保存原始特征列名
     original_features = X.columns.tolist()
     
@@ -97,13 +231,15 @@ def prepare_features(data, apply_feature_selection=True):
             pre_selector.fit(X, y)
             
             # 使用特征重要性进行初步选择
-            sfm = SelectFromModel(pre_selector, threshold='mean')
+            sfm = SelectFromModel(pre_selector, threshold='median')
             sfm.fit(X, y)
             selected_features_mask = sfm.get_support()
             selected_features = [f for f, selected in zip(original_features, selected_features_mask) if selected]
             
-            if len(selected_features) >= 5:  # 确保至少保留5个特征
-                logging.info(f"初步特征选择后保留{len(selected_features)}个特征")
+            # 确保至少保留一定数量的特征
+            min_features = min(10, len(original_features) // 2)
+            if len(selected_features) >= min_features:
+                logging.info(f"特征选择后保留{len(selected_features)}个特征")
                 X = X[selected_features]
                 feature_cols = selected_features
             else:
@@ -112,7 +248,107 @@ def prepare_features(data, apply_feature_selection=True):
             logging.error(f"特征选择过程出错: {str(e)}")
             logging.warning("将使用全部原始特征")
     
-    return X, y, feature_cols
+    return X, y, X.columns.tolist()
+
+def train_neural_network(X_train, y_train, X_test, y_test):
+    """训练神经网络模型"""
+    logging.info("训练神经网络模型...")
+    
+    # 定义神经网络参数
+    hidden_layers = [(50,), (100,), (50, 25), (100, 50)]
+    activations = ['relu', 'tanh']
+    alphas = [0.0001, 0.001, 0.01]
+    learning_rates = ['constant', 'adaptive']
+    
+    # 创建参数网格
+    param_grid = {
+        'hidden_layer_sizes': hidden_layers,
+        'activation': activations,
+        'alpha': alphas,
+        'learning_rate': learning_rates,
+        'max_iter': [1000],
+        'early_stopping': [True],
+        'random_state': [42]
+    }
+    
+    # 定义基础神经网络
+    nn_model = MLPRegressor()
+    
+    # 使用网格搜索找到最佳参数
+    grid_search = GridSearchCV(
+        estimator=nn_model,
+        param_grid=param_grid,
+        cv=3,
+        n_jobs=-1,
+        scoring='neg_mean_squared_error',
+        verbose=0
+    )
+    
+    try:
+        grid_search.fit(X_train, y_train)
+        logging.info(f"神经网络最佳参数: {grid_search.best_params_}")
+        
+        # 使用最佳参数训练最终模型
+        best_nn = MLPRegressor(**grid_search.best_params_)
+        best_nn.fit(X_train, y_train)
+        
+        # 评估模型
+        y_pred = best_nn.predict(X_test)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r2 = r2_score(y_test, y_pred)
+        
+        logging.info(f"神经网络 - 测试集 RMSE: {rmse:.2f}, R²: {r2:.2f}")
+        
+        return best_nn, rmse, r2
+    except Exception as e:
+        logging.error(f"神经网络训练失败: {str(e)}")
+        return None, float('inf'), -1.0
+
+def train_stacking_model(X_train, y_train, X_test, y_test):
+    """训练堆叠模型"""
+    logging.info("训练堆叠模型...")
+    
+    # 定义基础模型
+    base_models = [
+        RandomForestRegressor(n_estimators=100, max_depth=None, random_state=42),
+        GradientBoostingRegressor(n_estimators=100, max_depth=5, random_state=42),
+        AdaBoostRegressor(DecisionTreeRegressor(max_depth=5), n_estimators=50, random_state=42),
+        ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=42)
+    ]
+    
+    # 尝试添加神经网络（如果可行）
+    try:
+        nn_model = MLPRegressor(hidden_layer_sizes=(50,), activation='relu', 
+                               alpha=0.001, max_iter=1000, random_state=42)
+        base_models.append(nn_model)
+    except:
+        logging.warning("无法添加神经网络到基础模型中")
+    
+    # 定义元模型
+    meta_model = Ridge(alpha=1.0)
+    
+    # 创建堆叠模型
+    stacking_model = StackingRegressor(
+        base_models=base_models,
+        meta_model=meta_model,
+        n_folds=5
+    )
+    
+    # 训练模型
+    try:
+        stacking_model.fit(X_train, y_train)
+        
+        # 评估模型
+        y_pred = stacking_model.predict(X_test)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r2 = r2_score(y_test, y_pred)
+        
+        logging.info(f"堆叠模型 - 测试集 RMSE: {rmse:.2f}, R²: {r2:.2f}")
+        
+        return stacking_model, rmse, r2
+    except Exception as e:
+        logging.error(f"堆叠模型训练失败: {str(e)}")
+        return None, float('inf'), -1.0
 
 def cross_validate_model(X, y, n_splits=5):
     """交叉验证评估模型性能"""
@@ -145,8 +381,8 @@ def cross_validate_model(X, y, n_splits=5):
     
     return rmse_scores.mean(), mae_scores.mean(), r2_scores.mean()
 
-def train_model(X, y, output_dir=None):
-    """训练随机森林模型"""
+def train_model(X, y, output_dir=None, use_advanced_models=False):
+    """训练模型"""
     # 分割训练集和测试集
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     logging.info(f"训练集大小: {len(X_train)}, 测试集大小: {len(X_test)}")
@@ -178,11 +414,11 @@ def train_model(X, y, output_dir=None):
     # 进行网格搜索优化超参数
     logging.info("开始网格搜索优化模型...")
     param_grid = {
-        'n_estimators': [50, 100, 200, 300],
-        'max_depth': [None, 10, 20, 30, 40],
-        'min_samples_split': [2, 5, 10],
-        'min_samples_leaf': [1, 2, 4],
-        'max_features': ['auto', 'sqrt', 0.3, 0.5]
+        'n_estimators': [100, 200, 300],
+        'max_depth': [None, 20, 30],
+        'min_samples_split': [2, 5],
+        'min_samples_leaf': [1, 2],
+        'max_features': ['sqrt', 0.3, 0.5]
     }
     
     grid_search = GridSearchCV(
@@ -218,8 +454,13 @@ def train_model(X, y, output_dir=None):
     logging.info(f"优化后 - 训练集 RMSE: {best_train_rmse:.2f}, MAE: {best_train_mae:.2f}, R²: {best_train_r2:.2f}")
     logging.info(f"优化后 - 测试集 RMSE: {best_test_rmse:.2f}, MAE: {best_test_mae:.2f}, R²: {best_test_r2:.2f}")
     
+    # 初始化模型字典，存储所有训练的模型
+    models = {
+        '随机森林': (best_rf_model, best_test_rmse, best_test_r2)
+    }
+    
     # 尝试梯度提升模型
-    logging.info("尝试训练梯度提升模型作为对比...")
+    logging.info("训练梯度提升模型...")
     gb_model = GradientBoostingRegressor(random_state=42)
     gb_model.fit(X_train_scaled, y_train)
     
@@ -228,19 +469,27 @@ def train_model(X, y, output_dir=None):
     gb_test_r2 = r2_score(y_test, gb_test_pred)
     
     logging.info(f"梯度提升模型 - 测试集 RMSE: {gb_test_rmse:.2f}, R²: {gb_test_r2:.2f}")
+    models['梯度提升'] = (gb_model, gb_test_rmse, gb_test_r2)
     
-    # 选择性能更好的模型
-    final_model = best_rf_model
-    final_test_rmse = best_test_rmse
-    final_method = "随机森林"
+    # 如果使用高级模型
+    if use_advanced_models:
+        # 训练神经网络模型
+        nn_model, nn_rmse, nn_r2 = train_neural_network(X_train_scaled, y_train, X_test_scaled, y_test)
+        if nn_model is not None:
+            models['神经网络'] = (nn_model, nn_rmse, nn_r2)
+        
+        # 训练堆叠模型
+        stacking_model, stack_rmse, stack_r2 = train_stacking_model(
+            X_train_scaled, y_train, X_test_scaled, y_test
+        )
+        if stacking_model is not None:
+            models['堆叠模型'] = (stacking_model, stack_rmse, stack_r2)
     
-    if gb_test_rmse < best_test_rmse:
-        final_model = gb_model
-        final_test_rmse = gb_test_rmse
-        final_method = "梯度提升"
-        logging.info(f"最终选择{final_method}模型 (RMSE: {final_test_rmse:.2f})")
-    else:
-        logging.info(f"最终选择{final_method}模型 (RMSE: {final_test_rmse:.2f})")
+    # 选择性能最好的模型(基于RMSE)
+    best_model_name = min(models.keys(), key=lambda k: models[k][1])
+    final_model, final_rmse, final_r2 = models[best_model_name]
+    
+    logging.info(f"最终选择模型: {best_model_name} (RMSE: {final_rmse:.2f}, R²: {final_r2:.2f})")
     
     # 保存模型和数据转换器
     if output_dir is None:
@@ -248,32 +497,76 @@ def train_model(X, y, output_dir=None):
     os.makedirs(output_dir, exist_ok=True)
     
     model_path = os.path.join(output_dir, 'temperature_predictor.joblib')
-    scaler_path = os.path.join(output_dir, 'feature_scaler.joblib')
     
-    # 创建一个模型包，包含模型、特征名称和缩放器
+    # 创建一个模型包，包含模型、特征名称和缩放器等
     model_package = {
         'model': final_model,
         'feature_names': X.columns.tolist(),
         'scaler': scaler,
-        'model_type': final_method
+        'model_type': best_model_name,
+        'performance': {
+            'rmse': final_rmse,
+            'r2': final_r2
+        }
     }
     
     joblib.dump(model_package, model_path)
     logging.info(f"模型包已保存至: {model_path}")
     
-    # 生成特征重要性图
-    plot_feature_importance(final_model, X, output_dir)
+    # 生成特征重要性图(如果模型支持)
+    try:
+        plot_feature_importance(final_model, X, output_dir)
+    except:
+        logging.warning(f"{best_model_name}模型不支持生成特征重要性图")
     
     # 生成预测值与真实值对比图
-    if final_method == "随机森林":
-        plot_predictions(y_test, best_test_pred, output_dir)
-    else:
-        plot_predictions(y_test, gb_test_pred, output_dir)
+    # 使用所选模型的测试集预测
+    if best_model_name == '随机森林':
+        final_test_pred = best_test_pred
+    elif best_model_name == '梯度提升':
+        final_test_pred = gb_test_pred
+    elif best_model_name == '神经网络':
+        final_test_pred = nn_model.predict(X_test_scaled)
+    elif best_model_name == '堆叠模型':
+        final_test_pred = stacking_model.predict(X_test_scaled)
     
-    # 创建一个残差图
-    plot_residuals(y_test, best_test_pred, output_dir)
+    plot_predictions(y_test, final_test_pred, output_dir)
     
-    return final_model, X_test, y_test, best_test_pred
+    # 创建残差图
+    plot_residuals(y_test, final_test_pred, output_dir)
+    
+    # 如果是堆叠模型，生成模型比较图
+    plot_model_comparison(X_test_scaled, y_test, models, output_dir)
+    
+    return final_model, X_test, y_test, final_test_pred, best_model_name
+
+def plot_model_comparison(X_test, y_test, models, output_dir):
+    """绘制不同模型的性能比较"""
+    model_names = list(models.keys())
+    rmse_values = [models[name][1] for name in model_names]
+    r2_values = [models[name][2] for name in model_names]
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # RMSE比较（越低越好）
+    ax1.bar(model_names, rmse_values, color='salmon')
+    ax1.set_title('各模型RMSE比较')
+    ax1.set_ylabel('RMSE (°C)')
+    ax1.set_xticklabels(model_names, rotation=45, ha='right')
+    ax1.grid(True, linestyle='--', alpha=0.7)
+    
+    # R2比较（越高越好）
+    ax2.bar(model_names, r2_values, color='skyblue')
+    ax2.set_title('各模型R²比较')
+    ax2.set_ylabel('R²')
+    ax2.set_xticklabels(model_names, rotation=45, ha='right')
+    ax2.grid(True, linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    compare_path = os.path.join(output_dir, 'model_comparison.png')
+    plt.savefig(compare_path)
+    logging.info(f"模型比较图已保存至: {compare_path}")
+    plt.close()
 
 def plot_feature_importance(model, X, output_dir):
     """绘制特征重要性图"""
@@ -484,7 +777,6 @@ def process_directory(directory_path, model_path, output_dir=None):
         logging.error(f"预测过程中出错: {str(e)}")
         import traceback
         logging.error(traceback.format_exc())
-        return False
 
 def parse_args():
     """解析命令行参数"""
@@ -501,6 +793,12 @@ def parse_args():
                       help='是否启用特征选择')
     parser.add_argument('--no_normalization', action='store_true',
                       help='关闭特征标准化')
+    parser.add_argument('--advanced_models', action='store_true',
+                      help='使用高级模型（神经网络和堆叠模型）')
+    parser.add_argument('--interactions', action='store_true',
+                      help='使用特征交互')
+    parser.add_argument('--nonlinear', action='store_true',
+                      help='应用非线性特征变换')
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -540,17 +838,24 @@ if __name__ == "__main__":
             data = load_data(args.data)
             
             # 准备特征
-            X, y, feature_cols = prepare_features(data, apply_feature_selection=args.feature_selection)
+            X, y, feature_cols = prepare_features(
+                data, 
+                apply_feature_selection=args.feature_selection,
+                use_interaction=args.interactions,
+                use_nonlinear=args.nonlinear
+            )
             logging.info(f"使用{len(feature_cols)}个特征进行训练")
             
             # 执行交叉验证评估
             cv_rmse, cv_mae, cv_r2 = cross_validate_model(X, y)
             
             # 训练模型
-            model, X_test, y_test, y_pred = train_model(X, y, args.output)
+            model, X_test, y_test, y_pred, model_type = train_model(
+                X, y, args.output, use_advanced_models=args.advanced_models
+            )
             
             logging.info("训练完成！模型可用于预测新的PDB文件的最适温度")
-            logging.info(f"交叉验证RMSE: {cv_rmse:.2f}, 测试集R²: {r2_score(y_test, y_pred):.2f}")
+            logging.info(f"交叉验证RMSE: {cv_rmse:.2f}, 最终模型: {model_type}, 测试集R²: {r2_score(y_test, y_pred):.2f}")
         except Exception as e:
             logging.error(f"训练过程中出错: {str(e)}")
             import traceback
