@@ -98,4 +98,4 @@ protein-temperature-predictor/
 
 ---
 
-*开发者: 科研团队*
+*开发者: BIO221*
