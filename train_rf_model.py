@@ -227,23 +227,56 @@ def prepare_features(data, apply_feature_selection=True, use_interaction=False, 
         try:
             logging.info("开始进行特征选择...")
             # 初始化预选择模型
-            pre_selector = RandomForestRegressor(n_estimators=100, random_state=42)
+            pre_selector = RandomForestRegressor(n_estimators=150, random_state=42)
             pre_selector.fit(X, y)
             
-            # 使用特征重要性进行初步选择
-            sfm = SelectFromModel(pre_selector, threshold='median')
+            # 计算特征重要性
+            importances = pre_selector.feature_importances_
+            indices = np.argsort(importances)[::-1]
+            
+            # 记录特征重要性排名
+            for i, idx in enumerate(indices[:20]):  # 只记录前20个重要特征
+                if i < 10:  # 只显示前10个特征
+                    feature_name = X.columns[idx]
+                    logging.info(f"特征 {i+1}: {feature_name} - 重要性: {importances[idx]:.4f}")
+            
+            # 使用更精细的特征选择策略
+            # 1. 先使用SelectFromModel初步筛选高重要性特征
+            sfm = SelectFromModel(pre_selector, threshold='1.5*mean')
             sfm.fit(X, y)
             selected_features_mask = sfm.get_support()
             selected_features = [f for f, selected in zip(original_features, selected_features_mask) if selected]
             
             # 确保至少保留一定数量的特征
-            min_features = min(10, len(original_features) // 2)
+            min_features = max(15, len(original_features) // 4)  # 保留更多特征
+            
             if len(selected_features) >= min_features:
                 logging.info(f"特征选择后保留{len(selected_features)}个特征")
-                X = X[selected_features]
-                feature_cols = selected_features
+                
+                # 2. 使用交叉验证评估特征选择结果
+                X_selected = X[selected_features]
+                
+                # 创建评估管道
+                eval_pipe = Pipeline([
+                    ('scaler', StandardScaler()),
+                    ('model', RandomForestRegressor(n_estimators=100, random_state=42))
+                ])
+                
+                # 评估特征选择前后的性能
+                cv_before = cross_val_score(eval_pipe, X, y, cv=5, scoring='r2')
+                cv_after = cross_val_score(eval_pipe, X_selected, y, cv=5, scoring='r2')
+                
+                logging.info(f"特征选择前R²: {cv_before.mean():.3f}, 特征选择后R²: {cv_after.mean():.3f}")
+                
+                # 只有当特征选择后性能不下降时才使用选择后的特征集
+                if cv_after.mean() >= cv_before.mean() * 0.95:  # 允许5%的性能损失
+                    X = X_selected
+                    feature_cols = selected_features
+                    logging.info("应用特征选择结果")
+                else:
+                    logging.warning("特征选择导致性能显著下降，将使用全部特征")
             else:
-                logging.warning(f"特征选择后只剩{len(selected_features)}个特征，使用全部原始特征")
+                logging.warning(f"特征选择后只剩{len(selected_features)}个特征，低于最小阈值{min_features}，使用全部原始特征")
         except Exception as e:
             logging.error(f"特征选择过程出错: {str(e)}")
             logging.warning("将使用全部原始特征")
@@ -254,10 +287,10 @@ def train_neural_network(X_train, y_train, X_test, y_test):
     """训练神经网络模型"""
     logging.info("训练神经网络模型...")
     
-    # 定义神经网络参数
-    hidden_layers = [(50,), (100,), (50, 25), (100, 50)]
+    # 更复杂的神经网络结构
+    hidden_layers = [(100,), (200,), (100, 50), (200, 100), (100, 50, 25)]
     activations = ['relu', 'tanh']
-    alphas = [0.0001, 0.001, 0.01]
+    alphas = [0.0001, 0.001, 0.01, 0.1]
     learning_rates = ['constant', 'adaptive']
     
     # 创建参数网格
@@ -266,13 +299,13 @@ def train_neural_network(X_train, y_train, X_test, y_test):
         'activation': activations,
         'alpha': alphas,
         'learning_rate': learning_rates,
-        'max_iter': [1000],
+        'max_iter': [2000],  # 增加最大迭代次数
         'early_stopping': [True],
         'random_state': [42]
     }
     
     # 定义基础神经网络
-    nn_model = MLPRegressor()
+    nn_model = MLPRegressor(learning_rate_init=0.001, tol=1e-5)
     
     # 使用网格搜索找到最佳参数
     grid_search = GridSearchCV(
@@ -285,21 +318,54 @@ def train_neural_network(X_train, y_train, X_test, y_test):
     )
     
     try:
-        grid_search.fit(X_train, y_train)
+        # 先使用标准归一化处理数据
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        grid_search.fit(X_train_scaled, y_train)
         logging.info(f"神经网络最佳参数: {grid_search.best_params_}")
         
         # 使用最佳参数训练最终模型
-        best_nn = MLPRegressor(**grid_search.best_params_)
-        best_nn.fit(X_train, y_train)
+        best_nn = MLPRegressor(
+            **grid_search.best_params_,
+            learning_rate_init=0.001,
+            tol=1e-5,
+            n_iter_no_change=20  # 增加无改进次数阈值
+        )
+        best_nn.fit(X_train_scaled, y_train)
         
         # 评估模型
-        y_pred = best_nn.predict(X_test)
+        y_pred = best_nn.predict(X_test_scaled)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         r2 = r2_score(y_test, y_pred)
         
         logging.info(f"神经网络 - 测试集 RMSE: {rmse:.2f}, R²: {r2:.2f}")
         
-        return best_nn, rmse, r2
+        # 训练一个浅层简化版模型作为备选
+        simple_nn = MLPRegressor(
+            hidden_layer_sizes=(50,),
+            activation='relu',
+            alpha=0.01,
+            max_iter=2000,
+            early_stopping=True,
+            random_state=42
+        )
+        simple_nn.fit(X_train_scaled, y_train)
+        
+        # 评估简化模型
+        simple_y_pred = simple_nn.predict(X_test_scaled)
+        simple_rmse = np.sqrt(mean_squared_error(y_test, simple_y_pred))
+        simple_r2 = r2_score(y_test, simple_y_pred)
+        
+        logging.info(f"简化神经网络 - 测试集 RMSE: {simple_rmse:.2f}, R²: {simple_r2:.2f}")
+        
+        # 返回较好的模型
+        if simple_r2 > r2:
+            logging.info("选择简化神经网络模型")
+            return simple_nn, simple_rmse, simple_r2
+        else:
+            return best_nn, rmse, r2
     except Exception as e:
         logging.error(f"神经网络训练失败: {str(e)}")
         return None, float('inf'), -1.0
@@ -313,19 +379,21 @@ def train_stacking_model(X_train, y_train, X_test, y_test):
         RandomForestRegressor(n_estimators=100, max_depth=None, random_state=42),
         GradientBoostingRegressor(n_estimators=100, max_depth=5, random_state=42),
         AdaBoostRegressor(DecisionTreeRegressor(max_depth=5), n_estimators=50, random_state=42),
-        ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=42)
+        ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=42),
+        Lasso(alpha=0.01, random_state=42),
+        Ridge(alpha=1.0, random_state=42)
     ]
     
     # 尝试添加神经网络（如果可行）
     try:
         nn_model = MLPRegressor(hidden_layer_sizes=(50,), activation='relu', 
-                               alpha=0.001, max_iter=1000, random_state=42)
+                               alpha=0.01, max_iter=1000, random_state=42)
         base_models.append(nn_model)
     except:
         logging.warning("无法添加神经网络到基础模型中")
     
-    # 定义元模型
-    meta_model = Ridge(alpha=1.0)
+    # 定义元模型 - 使用梯度提升作为元模型
+    meta_model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.05, random_state=42)
     
     # 创建堆叠模型
     stacking_model = StackingRegressor(
@@ -336,10 +404,19 @@ def train_stacking_model(X_train, y_train, X_test, y_test):
     
     # 训练模型
     try:
-        stacking_model.fit(X_train, y_train)
+        # 先标准化数据
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # 转换为numpy数组避免索引错误
+        X_train_scaled = np.array(X_train_scaled)
+        y_train = np.array(y_train)
+        
+        stacking_model.fit(X_train_scaled, y_train)
         
         # 评估模型
-        y_pred = stacking_model.predict(X_test)
+        y_pred = stacking_model.predict(X_test_scaled)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         r2 = r2_score(y_test, y_pred)
         
@@ -348,6 +425,8 @@ def train_stacking_model(X_train, y_train, X_test, y_test):
         return stacking_model, rmse, r2
     except Exception as e:
         logging.error(f"堆叠模型训练失败: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
         return None, float('inf'), -1.0
 
 def cross_validate_model(X, y, n_splits=5):
@@ -355,7 +434,7 @@ def cross_validate_model(X, y, n_splits=5):
     logging.info(f"执行{n_splits}折交叉验证...")
     
     # 创建评估模型
-    base_model = RandomForestRegressor(n_estimators=100, random_state=42)
+    base_model = RandomForestRegressor(n_estimators=150, max_features='sqrt', random_state=42)
     
     # 创建包含数据标准化的管道
     model_pipeline = Pipeline([
@@ -363,7 +442,7 @@ def cross_validate_model(X, y, n_splits=5):
         ('model', base_model)
     ])
     
-    # 执行交叉验证
+    # 使用常规K折交叉验证
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     
     # 计算多个指标
@@ -374,26 +453,57 @@ def cross_validate_model(X, y, n_splits=5):
     r2_scores = cross_val_score(model_pipeline, X, y, cv=kf, 
                                scoring='r2')
     
+    # 自定义评分器：温度预测的相对误差
+    def temp_relative_error(y_true, y_pred):
+        return np.mean(np.abs((y_true - y_pred) / (y_true + 273.15))) * 100  # 返回相对误差百分比
+    
+    # 创建自定义评分器
+    from sklearn.metrics import make_scorer
+    rel_error_scorer = make_scorer(temp_relative_error, greater_is_better=False)
+    
+    # 计算相对误差
+    rel_error_scores = -cross_val_score(model_pipeline, X, y, cv=kf, 
+                                      scoring=rel_error_scorer)
+    
     # 输出结果
     logging.info(f"交叉验证结果 - RMSE: {rmse_scores.mean():.2f} ± {rmse_scores.std():.2f}")
     logging.info(f"交叉验证结果 - MAE: {mae_scores.mean():.2f} ± {mae_scores.std():.2f}")
     logging.info(f"交叉验证结果 - R²: {r2_scores.mean():.2f} ± {r2_scores.std():.2f}")
+    logging.info(f"交叉验证结果 - 相对误差: {rel_error_scores.mean():.2f}% ± {rel_error_scores.std():.2f}%")
     
     return rmse_scores.mean(), mae_scores.mean(), r2_scores.mean()
 
 def train_model(X, y, output_dir=None, use_advanced_models=False):
     """训练模型"""
-    # 分割训练集和测试集
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # 分割训练集和测试集 - 使用分层抽样
+    try:
+        # 将温度分组
+        y_bins = pd.cut(y, 5, labels=False)
+        from sklearn.model_selection import StratifiedShuffleSplit
+        
+        # 分层抽样
+        split = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        for train_idx, test_idx in split.split(X, y_bins):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        
+        logging.info("使用分层抽样分割数据集")
+    except Exception as e:
+        # 如果分层抽样失败，使用传统方法
+        logging.warning(f"分层抽样失败: {e}，使用传统方法")
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
     logging.info(f"训练集大小: {len(X_train)}, 测试集大小: {len(X_test)}")
+    logging.info(f"训练集温度范围: {y_train.min():.1f}°C - {y_train.max():.1f}°C")
+    logging.info(f"测试集温度范围: {y_test.min():.1f}°C - {y_test.max():.1f}°C")
     
     # 执行数据标准化
-    scaler = StandardScaler()
+    scaler = RobustScaler()  # 使用RobustScaler处理离群值
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
     # 创建并训练基础随机森林模型
-    rf_model = RandomForestRegressor(random_state=42)
+    rf_model = RandomForestRegressor(n_estimators=150, random_state=42)
     rf_model.fit(X_train_scaled, y_train)
     logging.info("基础随机森林模型训练完成")
     
@@ -411,14 +521,14 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
     logging.info(f"训练集 RMSE: {train_rmse:.2f}, MAE: {train_mae:.2f}, R²: {train_r2:.2f}")
     logging.info(f"测试集 RMSE: {test_rmse:.2f}, MAE: {test_mae:.2f}, R²: {test_r2:.2f}")
     
-    # 进行网格搜索优化超参数
+    # 进行网格搜索优化超参数 - 使用更复杂的参数网格
     logging.info("开始网格搜索优化模型...")
     param_grid = {
         'n_estimators': [100, 200, 300],
-        'max_depth': [None, 20, 30],
-        'min_samples_split': [2, 5],
-        'min_samples_leaf': [1, 2],
-        'max_features': ['sqrt', 0.3, 0.5]
+        'max_depth': [None, 20, 30, 40],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'max_features': ['sqrt', 0.3, 0.5, 0.7]
     }
     
     grid_search = GridSearchCV(
@@ -459,9 +569,27 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
         '随机森林': (best_rf_model, best_test_rmse, best_test_r2)
     }
     
-    # 尝试梯度提升模型
+    # 尝试梯度提升模型 - 使用更复杂的配置
     logging.info("训练梯度提升模型...")
-    gb_model = GradientBoostingRegressor(random_state=42)
+    param_grid_gb = {
+        'n_estimators': [100, 200],
+        'max_depth': [3, 5, 7],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'subsample': [0.8, 1.0]
+    }
+    
+    grid_search_gb = GridSearchCV(
+        estimator=GradientBoostingRegressor(random_state=42),
+        param_grid=param_grid_gb,
+        cv=3,
+        n_jobs=-1,
+        scoring='neg_mean_squared_error'
+    )
+    
+    grid_search_gb.fit(X_train_scaled, y_train)
+    logging.info(f"梯度提升最佳参数: {grid_search_gb.best_params_}")
+    
+    gb_model = GradientBoostingRegressor(**grid_search_gb.best_params_, random_state=42)
     gb_model.fit(X_train_scaled, y_train)
     
     gb_test_pred = gb_model.predict(X_test_scaled)
@@ -474,19 +602,19 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
     # 如果使用高级模型
     if use_advanced_models:
         # 训练神经网络模型
-        nn_model, nn_rmse, nn_r2 = train_neural_network(X_train_scaled, y_train, X_test_scaled, y_test)
+        nn_model, nn_rmse, nn_r2 = train_neural_network(X_train, y_train, X_test, y_test)
         if nn_model is not None:
             models['神经网络'] = (nn_model, nn_rmse, nn_r2)
         
         # 训练堆叠模型
         stacking_model, stack_rmse, stack_r2 = train_stacking_model(
-            X_train_scaled, y_train, X_test_scaled, y_test
+            X_train, y_train, X_test, y_test
         )
         if stacking_model is not None:
             models['堆叠模型'] = (stacking_model, stack_rmse, stack_r2)
     
-    # 选择性能最好的模型(基于RMSE)
-    best_model_name = min(models.keys(), key=lambda k: models[k][1])
+    # 选择性能最好的模型(基于R²) - 改为优先考虑R²而不是RMSE
+    best_model_name = max(models.keys(), key=lambda k: models[k][2])
     final_model, final_rmse, final_r2 = models[best_model_name]
     
     logging.info(f"最终选择模型: {best_model_name} (RMSE: {final_rmse:.2f}, R²: {final_r2:.2f})")
@@ -535,7 +663,7 @@ def train_model(X, y, output_dir=None, use_advanced_models=False):
     # 创建残差图
     plot_residuals(y_test, final_test_pred, output_dir)
     
-    # 如果是堆叠模型，生成模型比较图
+    # 生成模型比较图
     plot_model_comparison(X_test_scaled, y_test, models, output_dir)
     
     return final_model, X_test, y_test, final_test_pred, best_model_name
