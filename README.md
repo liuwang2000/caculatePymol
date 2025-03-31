@@ -1,77 +1,101 @@
-# PDB蛋白质最适温度预测模型
+# 🧬 蛋白质最适温度预测系统
 
-本项目使用随机森林算法根据PDB文件的结构特征预测蛋白质的最适温度。该模型使用了从PDB数据分析中提取的多种特征，能够帮助研究人员快速评估蛋白质的热稳定性。
+![Python](https://img.shields.io/badge/Python-3.6+-blue.svg)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-使用-orange.svg)
+![RandomForest](https://img.shields.io/badge/算法-随机森林-green.svg)
+![PDB](https://img.shields.io/badge/数据源-PDB结构-yellow.svg)
 
-## 功能特点
+## 📋 项目概述
 
-- 使用随机森林算法训练预测模型
-- 自动优化模型超参数
-- 生成特征重要性分析图表
-- 预测结果可视化
-- 直接分析PDB文件的能力
-- 完整的评估指标(RMSE, MAE, R²)
+本项目开发了一套基于**随机森林算法**的预测系统，能够通过分析蛋白质PDB结构文件的多种特征，准确预测蛋白质的最适工作温度。对于生物技术研究、酶工程设计和热稳定性评估具有重要参考价值。
 
-## 安装依赖
+### ✨ 核心特点
 
-确保已安装所有必要的依赖包：
+- 🤖 **智能算法**: 采用随机森林回归算法，具有优秀的非线性拟合能力
+- 🔍 **特征分析**: 自动从PDB文件提取关键结构特征
+- 🛠️ **超参数优化**: 内置网格搜索自动寻找最佳模型参数
+- 📊 **可视化报告**: 生成特征重要性和预测效果直观图表
+- 📈 **性能评估**: 提供完整的评估指标(RMSE, MAE, R²)
+- 🚀 **批量处理**: 支持批量分析多个PDB文件
+
+## 🔧 环境配置
+
+### 依赖安装
 
 ```bash
-pip install pandas numpy scikit-learn matplotlib joblib
+# 安装主要依赖包
+pip install pandas numpy scikit-learn matplotlib joblib biopython pymol
+
+# 或使用requirements文件安装(如果有)
+# pip install -r requirements.txt
 ```
 
-## 使用方法
+### 系统要求
 
-### 训练模型
+- Python 3.6+
+- PyMOL (用于PDB结构分析)
+- 足够的内存处理大型PDB文件
 
-使用默认参数训练模型：
+## 🚀 使用指南
+
+### 训练新模型
 
 ```bash
+# 使用默认参数训练模型
 python train_rf_model.py
+
+# 自定义训练数据和输出目录
+python train_rf_model.py --data ./trainData/your_data.csv --output ./custom_models
 ```
 
-自定义训练参数：
+### 预测蛋白质最适温度
 
 ```bash
-python train_rf_model.py --data ./path/to/your/data.csv --output ./models_custom
+# 预测目录中所有PDB文件的最适温度
+python train_rf_model.py --predict ./your_pdb_directory
+
+# 使用自定义模型进行预测
+python train_rf_model.py --predict ./your_pdb_directory --model ./path/to/your_model.joblib
 ```
 
-### 预测新的PDB结构最适温度
+## 📊 输出说明
 
-```bash
-python train_rf_model.py --predict ./path/to/your/pdb_file.pdb
+### 训练输出
+
+- `rf_temperature_predictor.joblib` - 训练好的模型文件
+- `feature_importance.png` - 特征重要性排序可视化图
+- `predictions_vs_actual.png` - 预测值与真实值对比散点图
+
+### 预测输出
+
+- `prediction_results.csv` - 包含每个PDB文件ID及其预测温度的结果表
+
+## 📁 项目结构
+
+```
+protein-temperature-predictor/
+├── train_rf_model.py     # 主程序：模型训练与预测
+├── analyze_pdb.py        # PDB结构特征提取程序
+├── merge_data.py         # 数据预处理与合并工具
+├── models/               # 存放训练好的模型
+├── output/               # 特征提取结果输出目录
+├── trainData/            # 训练数据集存放目录
+└── README.md             # 项目说明文档
 ```
 
-使用自定义模型文件：
+## 📝 注意事项
 
-```bash
-python train_rf_model.py --predict ./path/to/your/pdb_file.pdb --model ./path/to/your/model.joblib
-```
+- 模型预测精度依赖于训练数据的质量和代表性
+- PDB文件应包含完整的三维结构信息
+- 对于非常规结构的蛋白质，可能需要调整特征提取参数
+- 默认使用`trainData/analyze_pdb_merged_20250331_164045.csv`作为训练数据
 
-## 输出文件
+## 🔗 参考信息
 
-模型训练会生成以下文件：
+- 默认训练数据包含多种特征，如二级结构比例、表面极性、二硫键数量等
+- 归一化特征对预测精度有显著影响
+- 模型超参数可通过`train_rf_model.py`中的参数网格进行调整
 
-- `rf_temperature_predictor.joblib` - 训练好的随机森林模型
-- `feature_importance.png` - 特征重要性可视化图
-- `predictions_vs_actual.png` - 预测值与真实值对比图
+---
 
-预测模式会生成：
-
-- `prediction_result.csv` - 包含预测结果的CSV文件
-
-## 项目结构
-
-- `train_rf_model.py` - 主要脚本，包含训练和预测功能
-- `analyze_pdb.py` - PDB文件分析脚本，用于提取特征
-- `models/` - 存放训练好的模型
-- `trainData/` - 存放训练数据
-
-## 注意事项
-
-- 该模型需要完整的PDB特征数据才能进行准确预测
-- 模型的准确性取决于训练数据的质量和代表性
-- 对于特殊的PDB结构，可能需要额外的特征工程
-
-## 示例数据
-
-项目默认使用`trainData/analyze_pdb_merged_20250331_164045.csv`文件作为训练数据。该文件包含了多种PDB特征和对应的最适温度数据。
+*开发者: 科研团队*

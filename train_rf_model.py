@@ -67,7 +67,10 @@ def load_data(data_file):
 def prepare_features(data):
     """准备特征数据和目标变量"""
     # 排除不作为特征的列
-    exclude_columns = ['pdb_id', 'sequence', 'optimal_temperature']
+    exclude_columns = [
+        'pdb_id', 'sequence', 'optimal_temperature', 
+        'hydrogen_bonds', 'hydrophobic_contacts', 'salt_bridges', 'hydrophobic_sasa'
+    ]
     
     # 准备特征和目标变量
     feature_cols = [col for col in data.columns if col not in exclude_columns]
