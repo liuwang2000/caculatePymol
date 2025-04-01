@@ -13,6 +13,11 @@ from pymol import cmd
 import argparse
 import numpy as np
 
+# 确保result目录存在
+os.makedirs('result', exist_ok=True)
+# 确保output目录存在
+os.makedirs('output', exist_ok=True)
+
 # 配置日志记录
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -26,9 +31,7 @@ def parse_residue(res_str):
         raise ValueError(f"Invalid residue format: {res_str}")
     return (match.group(1).upper(), match.group(2))
 
-# 删除整个 calculate_catalytic_distance 函数
-
-def analyze_pdb_features(pdb_path):  # 移除 catalytic_residues 参数
+def analyze_pdb_features(pdb_path):
     """PyMOL特征分析"""
     features = {}
     try:
@@ -71,8 +74,6 @@ def analyze_pdb_features(pdb_path):  # 移除 catalytic_residues 参数
         salt_bridges = cmd.find_pairs(positive, negative, mode=2, cutoff=4.0)
         features['salt_bridges'] = len(salt_bridges)
       
-            
- 
         cmd.delete(obj_name)
     except Exception as e:
         logging.error(f"PyMOL分析失败: {str(e)}")
@@ -168,7 +169,7 @@ def calculate_secondary_structure(pdb_path):
     return result
 
 def extract_thermostability_features(pdb_path):
-    """提取热稳定性相关特征 - 简化优化版本，专注于最关键的高温蛋白特征"""
+    """提取热稳定性相关特征 - 优化增强版本，增加更全面的高温蛋白特征"""
     features = {}
     obj_name = os.path.splitext(os.path.basename(pdb_path))[0]
     
@@ -199,204 +200,282 @@ def extract_thermostability_features(pdb_path):
         surface_residues = cmd.count_atoms(f"{obj_name} and b > 30 and name ca")
         features['surface_charge_ratio'] = charged_residues / (surface_residues or 1)
         
-        # 4. IVYWREL指数 - 高温蛋白质的关键指标
-        ivywrel = 'resn ile+val+tyr+trp+arg+glu+leu'
-        ivywrel_count = cmd.count_atoms(f"{obj_name} and {ivywrel} and name ca")
+        # 4. IVYWREL指数 (Val, Ile, Tyr, Trp, Arg, Glu, Leu的比例)
+        cmd.select('ivywrel', f"{obj_name} and resn val+ile+tyr+trp+arg+glu+leu")
+        ivywrel_count = cmd.count_atoms('ivywrel and name ca')
         features['ivywrel_index'] = ivywrel_count / total_residues
         
-        # 5. 紧密氢键网络
-        donors = '(resn arg+lys+his+asn+gln+ser+thr+tyr+trp & name n+od1+od2+oe1+oe2)'
-        acceptors = '(resn asp+glu+asn+gln+ser+thr+his+tyr & name o+od1+od2+oe1+oe2)'
-        dense_hbonds = cmd.find_pairs(donors, acceptors, mode=1, cutoff=3.4)
-        features['dense_hbond_network'] = len([p for p in dense_hbonds if p[0][1] != p[1][1]]) / total_residues
+        # 5. 密集氢键网络
+        donors = '(resn arg+lys+his+asn+gln+ser+thr+tyr+trp)'
+        acceptors = '(resn asp+glu+asn+gln+ser+thr+his+tyr)'
+        hbonds = cmd.find_pairs(f"{donors} and name n+nd1+ne2+og+og1+oh", 
+                             f"{acceptors} and name o+od1+od2+oe1+oe2+nd1+oe1+oe2", 
+                             mode=1, cutoff=3.5)
+        features['dense_hbond_network'] = len([p for p in hbonds if abs(p[0][1] - p[1][1]) > 5]) / total_residues
         
-        # 6. 紧凑性指数
-        ca_coordinates = []
-        cmd.iterate_state(1, f"{obj_name} and name ca", 
-                         "ca_coordinates.append([x,y,z])", space={"ca_coordinates": ca_coordinates})
-        if len(ca_coordinates) > 1:
-            from scipy.spatial.distance import pdist
-            distances = pdist(ca_coordinates)
-            features['compactness_index'] = 1.0 / np.mean(distances)
-        else:
-            features['compactness_index'] = 0.0
+        # 6. 紧凑度指数 (环路残基比例的倒数，越低越紧凑)
+        cmd.dss()  # 计算二级结构
+        loop_residues = cmd.count_atoms(f"{obj_name} and ss l and name ca")
+        features['compactness_index'] = 1 - (loop_residues / total_residues)
         
-        # 7. 螺旋和β片层稳定性
-        ss_helix = cmd.count_atoms(f"{obj_name} and ss h and name ca")
-        ss_sheet = cmd.count_atoms(f"{obj_name} and ss s and name ca")
-        features['helix_sheet_ratio'] = (ss_helix + ss_sheet) / total_residues
+        # 7. 二级结构比例 - 对热稳定性有重要影响
+        helix_residues = cmd.count_atoms(f"{obj_name} and ss h and name ca")
+        sheet_residues = cmd.count_atoms(f"{obj_name} and ss s and name ca")
+        features['helix_ratio'] = helix_residues / total_residues
+        features['sheet_ratio'] = sheet_residues / total_residues
         
-        # 8. 芳香族相互作用 - 对热稳定性有重要贡献
+        # 8. 螺旋/片层比例 - 高温蛋白通常具有更高的螺旋结构比例
+        features['helix_sheet_ratio'] = (helix_residues / sheet_residues) if sheet_residues > 0 else 0
+        
+        # 9. 芳香族氨基酸相互作用 - 增强蛋白质稳定性
         aromatic = 'resn phe+tyr+trp+his'
-        aromatic_pairs = cmd.find_pairs(f"{obj_name} and {aromatic} and name ca", 
-                                      f"{obj_name} and {aromatic} and name ca", 
-                                      cutoff=7.0)
-        features['aromatic_interactions'] = len(aromatic_pairs) / total_residues
+        arom_interactions = cmd.find_pairs(f"{aromatic} and not name c+n+o+ca", 
+                                         f"{aromatic} and not name c+n+o+ca", 
+                                         mode=1, cutoff=6.0)
+        # 过滤出不同残基之间的相互作用
+        filtered_arom = [p for p in arom_interactions if p[0][1] != p[1][1]]
+        features['aromatic_interactions'] = len(filtered_arom) / total_residues
         
-        # 9. 甘氨酸含量 - 低甘氨酸含量与高温稳定性相关
-        gly_count = cmd.count_atoms(f"{obj_name} and resn gly and name ca")
-        features['glycine_content'] = gly_count / total_residues
+        # 10. 疏水核心联系密度 - 高温蛋白的疏水核心通常更为紧密
+        cmd.select('hydrophobic', f"{obj_name} and resn ala+val+leu+ile+met+phe+trp")
+        hydrophobic_contacts = cmd.find_pairs('hydrophobic and b < 10', 
+                                           'hydrophobic and b < 10', 
+                                           mode=1, cutoff=5.0)
+        hydrophobic_core = cmd.count_atoms('hydrophobic and b < 10 and name ca')
+        features['hydrophobic_core_density'] = len(hydrophobic_contacts) / (hydrophobic_core or 1)
         
+        # 11. 荷电氨基酸分布 - 计算各类荷电氨基酸比例
+        for aa in ['ARG', 'LYS', 'ASP', 'GLU', 'HIS']:
+            cmd.select(f'aa_{aa.lower()}', f"{obj_name} and resn {aa}")
+            aa_count = cmd.count_atoms(f'aa_{aa.lower()} and name ca')
+            features[f'aa_{aa}_ratio'] = aa_count / total_residues
+        
+        # 12. 脯氨酸含量 - 可能影响蛋白质刚性
+        cmd.select('proline', f"{obj_name} and resn pro")
+        proline_count = cmd.count_atoms('proline and name ca')
+        features['proline_content'] = proline_count / total_residues
+        
+        # 13. 甘氨酸含量 - 通常在高温蛋白质中含量较低
+        cmd.select('glycine', f"{obj_name} and resn gly")
+        glycine_count = cmd.count_atoms('glycine and name ca')
+        features['glycine_content'] = glycine_count / total_residues
+        
+        # 14. 疏水性氨基酸总含量
+        cmd.select('all_hydrophobic', f"{obj_name} and resn ala+val+leu+ile+met+phe+trp+pro")
+        hydrophobic_total = cmd.count_atoms('all_hydrophobic and name ca')
+        features['hydrophobic_content'] = hydrophobic_total / total_residues
+        
+        # 15. 极性氨基酸总含量
+        cmd.select('polar', f"{obj_name} and resn ser+thr+asn+gln+tyr")
+        polar_total = cmd.count_atoms('polar and name ca')
+        features['polar_content'] = polar_total / total_residues
+        
+        # 16. 计算荷电网络的连通性 - 荷电网络中每个氨基酸平均接触数
+        if len(ion_pairs) > 0:
+            # 提取所有参与离子对的残基
+            ion_residues = set()
+            for pair in ion_pairs:
+                ion_residues.add((pair[0][0], pair[0][1]))  # 格式化为(chain, resid)
+                ion_residues.add((pair[1][0], pair[1][1]))
+            
+            # 计算每个荷电残基的平均接触数
+            contacts_per_residue = len(ion_pairs) * 2 / len(ion_residues)
+            features['ion_network_connectivity'] = contacts_per_residue
+        else:
+            features['ion_network_connectivity'] = 0.0
+            
+        # 17. 表面-体积比
+        # 计算蛋白质表面积和体积
+        cmd.set('solvent_radius', 1.4)
+        surface_area = cmd.get_area(obj_name)
+        
+        # 使用PyMOL计算体积的近似值
+        # 注意：这是一个近似方法
+        cmd.create('surf_obj', f"{obj_name}")
+        cmd.set('surface_quality', 2)
+        cmd.show('surface', 'surf_obj')
+        # 获取体积 (单位：立方埃)
+        results = []
+        cmd.iterate_state(1, 'surf_obj', 'results.append((x,y,z))', space={'results': results})
+        if results:
+            # 使用凸包体积作为近似
+            from scipy.spatial import ConvexHull
+            try:
+                hull = ConvexHull(results)
+                volume = hull.volume
+                features['surface_volume_ratio'] = surface_area / (volume or 1)
+            except:
+                features['surface_volume_ratio'] = 0.0
+        else:
+            features['surface_volume_ratio'] = 0.0
+        
+        cmd.delete('surf_obj')
+        
+        # 清理选择器
         cmd.delete(obj_name)
-        
-        logging.info(f"成功提取 {pdb_path} 的热稳定性特征")
     except Exception as e:
         logging.error(f"热稳定性特征提取失败: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
     
     return features
 
-def process_directory(input_path, extract_thermo_features=True):  # 添加提取热稳定性特征选项
-    """批量处理PDB目录或单个PDB文件"""
-    # 创建输出目录
-    output_dir = os.path.join(os.getcwd(), 'output')
+def process_pdb_file(pdb_path, extract_thermo_features=True, optimized=False):
+    """处理单个PDB文件并提取特征"""
+    try:
+        features = {'pdb_id': os.path.splitext(os.path.basename(pdb_path))[0]}
+        
+        # PyMOL基础特征
+        pymol_features = analyze_pdb_features(pdb_path)
+        features.update(pymol_features)
+        
+        # Biopython特征
+        bio_features = extract_biopython_features(pdb_path)
+        features.update(bio_features)
+        
+        # 热稳定性特征提取
+        if extract_thermo_features:
+            logging.info(f"为{features['pdb_id']}提取热稳定性特征...")
+            thermo_features = extract_thermostability_features(pdb_path)
+            features.update(thermo_features)
+        
+        return features
+    except Exception as e:
+        logging.error(f"处理PDB文件 {pdb_path} 时出错: {str(e)}")
+        return {'pdb_id': os.path.splitext(os.path.basename(pdb_path))[0], 'error': str(e)}
+
+def process_directory(directory, output_dir='output', extract_thermo_features=True, optimized=False):
+    """处理目录中的所有PDB文件"""
+    if not os.path.exists(directory):
+        logging.error(f"目录不存在: {directory}")
+        return
+    
+    # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     
-    # 生成带时间戳的输出文件名
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_csv = os.path.join(output_dir, f'analyze_pdb_{timestamp}.csv')  # 修改输出路径
+    # 收集所有PDB文件
+    pdb_files = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith(('.pdb', '.ent')):
+                pdb_files.append(os.path.join(root, file))
     
-    # 动态收集所有可能的氨基酸字段
-    all_aa_fields = set()
-    reports = []
-
-    # 判断输入是文件还是目录
-    if os.path.isfile(input_path) and input_path.lower().endswith('.pdb'):
-        # 如果是单个PDB文件
-        pdb_path = input_path
-        pdb_id = os.path.splitext(os.path.basename(pdb_path))[0]
-        logging.info(f"正在处理单个文件: {pdb_id}")
-        
-        # 提取特征
-        report = {'pdb_id': pdb_id}
-        report.update(analyze_pdb_features(pdb_path))
-        report.update(extract_biopython_features(pdb_path))
-        
-        # 添加热稳定性特征提取
-        if extract_thermo_features:
-            logging.info(f"为 {pdb_id} 提取热稳定性特征")
-            report.update(extract_thermostability_features(pdb_path))
-        
-        # 计算蛋白质中的氨基酸总数
-        try:
-            cmd.reinitialize()
-            obj_name = os.path.splitext(os.path.basename(pdb_path))[0]
-            cmd.load(pdb_path, obj_name)
-            total_residues = cmd.count_atoms(f"{obj_name} and name ca")
-            
-            # 归一化相关指标
-            if total_residues > 0:
-                report['hydrogen_bonds_norm'] = report['hydrogen_bonds'] / total_residues
-                report['hydrophobic_contacts_norm'] = report['hydrophobic_contacts'] / total_residues
-                report['salt_bridges_norm'] = report['salt_bridges'] / total_residues
-                report['hydrophobic_sasa_norm'] = report['hydrophobic_sasa'] / total_residues
-                
-            cmd.delete(obj_name)
-        except Exception as e:
-            logging.error(f"归一化计算失败: {str(e)}")
-        
-        # 展平氨基酸组成并收集字段
-        aa_comp = report.pop('aa_composition', {})
-        for aa in aa_comp.keys():
-            all_aa_fields.add(f'aa_{aa}')
-        for aa, val in aa_comp.items():
-            report[f'aa_{aa}'] = round(val, 4)
-        
-        reports.append(report)
-    elif os.path.isdir(input_path):
-        # 如果是目录，处理所有PDB文件
-        for filename in os.listdir(input_path):
-            if not filename.lower().endswith('.pdb'):
-                continue
-              
-            pdb_path = os.path.join(input_path, filename)
-            pdb_id = os.path.splitext(filename)[0]
-            logging.info(f"正在处理: {pdb_id}")
-          
-            # 提取特征
-            report = {'pdb_id': pdb_id}
-            report.update(analyze_pdb_features(pdb_path))
-            report.update(extract_biopython_features(pdb_path))
-            
-            # 添加热稳定性特征提取
-            if extract_thermo_features:
-                logging.info(f"为 {pdb_id} 提取热稳定性特征")
-                report.update(extract_thermostability_features(pdb_path))
-            
-            # 计算蛋白质中的氨基酸总数
-            try:
-                cmd.reinitialize()
-                obj_name = os.path.splitext(os.path.basename(pdb_path))[0]
-                cmd.load(pdb_path, obj_name)
-                total_residues = cmd.count_atoms(f"{obj_name} and name ca")
-                
-                # 归一化相关指标
-                if total_residues > 0:
-                    report['hydrogen_bonds_norm'] = report['hydrogen_bonds'] / total_residues
-                    report['hydrophobic_contacts_norm'] = report['hydrophobic_contacts'] / total_residues
-                    report['salt_bridges_norm'] = report['salt_bridges'] / total_residues
-                    report['hydrophobic_sasa_norm'] = report['hydrophobic_sasa'] / total_residues
-                    
-                cmd.delete(obj_name)
-            except Exception as e:
-                logging.error(f"归一化计算失败: {str(e)}")
-          
-            # 展平氨基酸组成并收集字段
-            aa_comp = report.pop('aa_composition', {})
-            for aa in aa_comp.keys():
-                all_aa_fields.add(f'aa_{aa}')
-            for aa, val in aa_comp.items():
-                report[f'aa_{aa}'] = round(val, 4)
-              
-            reports.append(report)
-    else:
-        logging.error(f"输入路径既不是PDB文件也不是目录: {input_path}")
+    if not pdb_files:
+        logging.error(f"目录 {directory} 中未找到PDB文件")
         return
-
-    # 合并字段到fieldnames，添加新的归一化字段和热稳定性字段
-    fieldnames = [
-        'pdb_id', 'disulfide_bonds', 'surface_polar_ratio', 'hydrogen_bonds', 'hydrogen_bonds_norm',
-        'hydrophobic_contacts', 'hydrophobic_contacts_norm', 'salt_bridges', 'salt_bridges_norm',
-        'hydrophobic_sasa', 'hydrophobic_sasa_norm', 'mean_sasa', 'helix', 'sheet', 'loop'
-    ]
     
-    # 添加热稳定性特征字段
-    if extract_thermo_features:
-        thermo_fields = [
-            'ion_pair_density', 'core_residue_ratio', 'surface_charge_ratio', 
-            'ivywrel_index', 'dense_hbond_network', 'compactness_index',
-            'helix_sheet_ratio', 'aromatic_interactions', 'glycine_content'
-        ]
-        fieldnames.extend(thermo_fields)
+    logging.info(f"在 {directory} 中找到 {len(pdb_files)} 个PDB文件")
     
-    # 添加氨基酸组成字段
-    fieldnames.extend(sorted(all_aa_fields))
-
-    with open(output_csv, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for report in reports:
-            # 填充缺失的氨基酸字段为0
-            for aa_field in all_aa_fields:
-                if aa_field not in report:
-                    report[aa_field] = 0.0
-            writer.writerow(report)
-            
-    logging.info(f"分析完成，结果已保存至 {output_csv}")
-
-if __name__ == "__main__":
-    # 创建参数解析器
-    parser = argparse.ArgumentParser(description="分析PDB文件提取特征")
-    parser.add_argument("input_path", help="输入PDB文件或包含PDB文件的目录路径")
-    parser.add_argument("--thermostability", action="store_true", help="是否提取热稳定性相关特征")
-    parser.add_argument("--output_dir", default="output", help="输出目录路径，默认为'output'")
+    # 处理所有PDB文件
+    results = []
+    for pdb_file in pdb_files:
+        logging.info(f"处理文件: {os.path.basename(pdb_file)}")
+        features = process_pdb_file(pdb_file, extract_thermo_features=extract_thermo_features, optimized=False)
+        if features:
+            results.append(features)
     
-    # 解析命令行参数
+    # 保存到CSV
+    if results:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = os.path.join(output_dir, f"analyze_pdb_{timestamp}.csv")
+        
+        # 获取所有字段
+        fieldnames = set()
+        for result in results:
+            for key in result.keys():
+                if key != 'aa_composition':  # 排除氨基酸组成字典
+                    fieldnames.add(key)
+        
+        # 添加氨基酸组成字段
+        aa_types = set()
+        for result in results:
+            if 'aa_composition' in result:
+                aa_types.update(result['aa_composition'].keys())
+        
+        for aa in aa_types:
+            fieldnames.add(f"aa_{aa}")
+        
+        # 写入CSV
+        with open(output_file, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=sorted(fieldnames))
+            writer.writeheader()
+            for result in results:
+                row = {}
+                for key, value in result.items():
+                    if key != 'aa_composition':
+                        row[key] = value
+                
+                # 展开氨基酸组成
+                if 'aa_composition' in result:
+                    for aa, fraction in result['aa_composition'].items():
+                        row[f"aa_{aa}"] = fraction
+                
+                writer.writerow(row)
+        
+        logging.info(f"分析结果已保存到: {output_file}")
+        return output_file
+    else:
+        logging.warning("没有生成任何分析结果")
+        return None
+
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(description='分析PDB文件的特征')
+    parser.add_argument('input_path', help='输入PDB文件或包含PDB文件的目录路径')
+    parser.add_argument('--output_dir', default='output', help='输出目录路径')
+    parser.add_argument('--thermostability', action='store_true', help='是否提取热稳定性特征')
+    
     args = parser.parse_args()
     
-    # 创建输出目录
+    # 确保输出目录存在
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 处理PDB文件/目录
-    process_directory(args.input_path, extract_thermo_features=args.thermostability)
-    
-    logging.info(f"分析完成，结果已保存至 {args.output_dir}/ 目录")
+    # 处理输入
+    if os.path.isdir(args.input_path):
+        process_directory(args.input_path, args.output_dir, 
+                          extract_thermo_features=args.thermostability)
+    elif os.path.isfile(args.input_path) and args.input_path.lower().endswith(('.pdb', '.ent')):
+        # 单个PDB文件处理
+        features = process_pdb_file(args.input_path, 
+                                   extract_thermo_features=args.thermostability)
+        
+        if features:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = os.path.join(args.output_dir, f"analyze_pdb_{timestamp}.csv")
+            
+            # 获取所有字段
+            fieldnames = set()
+            for key in features.keys():
+                if key != 'aa_composition':  # 排除氨基酸组成字典
+                    fieldnames.add(key)
+            
+            # 添加氨基酸组成字段
+            if 'aa_composition' in features:
+                for aa in features['aa_composition'].keys():
+                    fieldnames.add(f"aa_{aa}")
+            
+            # 写入CSV
+            with open(output_file, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=sorted(fieldnames))
+                writer.writeheader()
+                
+                row = {}
+                for key, value in features.items():
+                    if key != 'aa_composition':
+                        row[key] = value
+                
+                # 展开氨基酸组成
+                if 'aa_composition' in features:
+                    for aa, fraction in features['aa_composition'].items():
+                        row[f"aa_{aa}"] = fraction
+                
+                writer.writerow(row)
+            
+            logging.info(f"分析结果已保存到: {output_file}")
+        else:
+            logging.warning("没有生成分析结果")
+    else:
+        logging.error(f"无效的输入路径: {args.input_path}")
+
+if __name__ == "__main__":
+    main()
