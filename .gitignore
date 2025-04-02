@@ -7,3 +7,6 @@ prediction_results.csv
 result/*
 Alphafold/*
 *optimized/*
+Alphafold*
+models*
+result*

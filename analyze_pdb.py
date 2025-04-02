@@ -41,38 +41,44 @@ def analyze_pdb_features(pdb_path):
         cmd.load(pdb_path, obj_name)
         cmd.set('solvent_radius', 1.4)
       
+        # 计算蛋白质总氨基酸数
+        total_residues = cmd.count_atoms(f"{obj_name} and name ca")
+        if total_residues == 0:
+            logging.error(f"无法在{pdb_path}中找到氨基酸残基")
+            return features
+      
         # 计算溶剂可及性
         cmd.get_area(obj_name, load_b=1)
       
         # 二硫键
         cysteines = cmd.find_pairs('(resn cys & name sg)', '(resn cys & name sg)', 
                                  mode=1, cutoff=2.2)
-        features['disulfide_bonds'] = len(cysteines)
+        features['disulfide_bonds_ratio'] = len(cysteines) / total_residues
       
         # 表面极性比例
         cmd.set('dot_solvent', 1)  # 开启溶剂点计算
         cmd.set('dot_density', 3)  # 提高点密度
         cmd.select('surface', 'b > 10')
         polar = cmd.count_atoms('surface & (resn arg+lys+asp+glu+asn+gln+his+ser+thr+tyr)')
-        total = cmd.count_atoms('surface')
-        features['surface_polar_ratio'] = polar/total if total >0 else 0
+        total_surface = cmd.count_atoms('surface')
+        features['surface_polar_ratio'] = polar/total_surface if total_surface >0 else 0
       
         # 氢键网络（优化版）
         donors = '(resn arg+lys+his+asn+gln+ser+thr+tyr+trp & name n+od1+od2+oe1+oe2)'
         acceptors = '(resn asp+glu+asn+gln+ser+thr+his+tyr & name o+od1+od2+oe1+oe2)'
         hbonds = cmd.find_pairs(donors, acceptors, mode=1, cutoff=3.2)
-        features['hydrogen_bonds'] = len([p for p in hbonds if p[0][1] != p[1][1]])
+        features['hydrogen_bonds_ratio'] = len([p for p in hbonds if p[0][1] != p[1][1]]) / total_residues
       
         # 疏水核心
         cmd.select('hydrophobic_core', 'resn ala+val+ile+leu+phe+trp+pro+met & b < 10')
         contacts = cmd.find_pairs('hydrophobic_core', 'hydrophobic_core', cutoff=5.0)
-        features['hydrophobic_contacts'] = len(contacts)
+        features['hydrophobic_contacts_ratio'] = len(contacts) / total_residues
       
         # 盐桥
         positive = 'resn arg+lys'
         negative = 'resn asp+glu'
         salt_bridges = cmd.find_pairs(positive, negative, mode=2, cutoff=4.0)
-        features['salt_bridges'] = len(salt_bridges)
+        features['salt_bridges_ratio'] = len(salt_bridges) / total_residues
       
         cmd.delete(obj_name)
     except Exception as e:
@@ -93,26 +99,36 @@ def extract_biopython_features(pdb_path):
             warnings.simplefilter('ignore', BiopythonWarning)
             structure = parser.get_structure('protein', pdb_path)
       
+        # 计算总残基数
+        total_residues = sum(1 for _ in structure.get_residues() if _.get_resname() not in ['HOH', 'WAT'])
+        if total_residues == 0:
+            return features
+      
         # 氨基酸组成
         aa_count = defaultdict(int)
         for residue in structure.get_residues():
             resname = residue.get_resname()
             if resname not in ['HOH', 'WAT']:
                 aa_count[resname] += 1
-        total = sum(aa_count.values()) or 1
-        features['aa_composition'] = {k: v/total for k, v in aa_count.items()}
+        features['aa_composition'] = {k: v/total_residues for k, v in aa_count.items()}
       
         # SASA计算
         sasa_calculator = ShrakeRupley()
         sasa_calculator.compute(structure, level='R')
         hydrophobic = ['ALA', 'VAL', 'LEU', 'ILE', 'PHE', 'PRO', 'MET', 'TRP']
-        sasa_data = {'total': 0.0, 'count': 0}
+        hydrophobic_sasa = 0.0
+        hydrophobic_count = 0
+        total_sasa = 0.0
+      
         for residue in structure.get_residues():
             if residue.get_resname() in hydrophobic:
-                sasa_data['total'] += residue.sasa
-                sasa_data['count'] += 1
-        features['hydrophobic_sasa'] = sasa_data['total']
-        features['mean_sasa'] = sasa_data['total']/sasa_data['count'] if sasa_data['count']>0 else 0
+                hydrophobic_sasa += residue.sasa
+                hydrophobic_count += 1
+            if residue.get_resname() not in ['HOH', 'WAT']:
+                total_sasa += residue.sasa
+      
+        features['hydrophobic_sasa_ratio'] = hydrophobic_sasa / total_sasa if total_sasa > 0 else 0
+        features['mean_sasa_per_residue'] = total_sasa / total_residues if total_residues > 0 else 0
       
         # 二级结构（改用PyMOL分析）
         features.update(calculate_secondary_structure(pdb_path))
@@ -323,32 +339,75 @@ def extract_thermostability_features(pdb_path):
 def process_pdb_file(pdb_path, extract_thermo_features=True, optimized=False):
     """处理单个PDB文件并提取特征"""
     try:
+        # 确保PDB文件路径是绝对路径
+        pdb_path = os.path.abspath(pdb_path)
+        
+        # 检查文件是否存在
+        if not os.path.exists(pdb_path):
+            logging.error(f"PDB文件不存在: {pdb_path}")
+            return {'pdb_id': os.path.splitext(os.path.basename(pdb_path))[0], 'error': 'PDB文件不存在'}
+            
+        # 检查文件大小
+        if os.path.getsize(pdb_path) == 0:
+            logging.error(f"PDB文件为空: {pdb_path}")
+            return {'pdb_id': os.path.splitext(os.path.basename(pdb_path))[0], 'error': 'PDB文件为空'}
+        
         features = {'pdb_id': os.path.splitext(os.path.basename(pdb_path))[0]}
         
         # PyMOL基础特征
-        pymol_features = analyze_pdb_features(pdb_path)
-        features.update(pymol_features)
+        try:
+            logging.info(f"为{features['pdb_id']}使用PyMOL提取基础特征...")
+            pymol_features = analyze_pdb_features(pdb_path)
+            if not pymol_features:
+                logging.warning(f"PyMOL未能为{features['pdb_id']}提取特征")
+            features.update(pymol_features)
+        except Exception as e:
+            logging.error(f"PyMOL特征提取失败: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
         
         # Biopython特征
-        bio_features = extract_biopython_features(pdb_path)
-        features.update(bio_features)
+        try:
+            logging.info(f"为{features['pdb_id']}使用Biopython提取特征...")
+            bio_features = extract_biopython_features(pdb_path)
+            if not bio_features:
+                logging.warning(f"Biopython未能为{features['pdb_id']}提取特征")
+            features.update(bio_features)
+        except Exception as e:
+            logging.error(f"Biopython特征提取失败: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
         
         # 热稳定性特征提取
         if extract_thermo_features:
-            logging.info(f"为{features['pdb_id']}提取热稳定性特征...")
-            thermo_features = extract_thermostability_features(pdb_path)
-            features.update(thermo_features)
+            try:
+                logging.info(f"为{features['pdb_id']}提取热稳定性特征...")
+                thermo_features = extract_thermostability_features(pdb_path)
+                if not thermo_features:
+                    logging.warning(f"未能为{features['pdb_id']}提取热稳定性特征")
+                features.update(thermo_features)
+            except Exception as e:
+                logging.error(f"热稳定性特征提取失败: {str(e)}")
+                import traceback
+                logging.error(traceback.format_exc())
         
+        # 确保至少提取了一些特征
+        if len(features) <= 1:  # 只有pdb_id
+            logging.error(f"无法为{features['pdb_id']}提取任何特征")
+            features['error'] = '无法提取特征'
+            
         return features
     except Exception as e:
         logging.error(f"处理PDB文件 {pdb_path} 时出错: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
         return {'pdb_id': os.path.splitext(os.path.basename(pdb_path))[0], 'error': str(e)}
 
 def process_directory(directory, output_dir='output', extract_thermo_features=True, optimized=False):
     """处理目录中的所有PDB文件"""
     if not os.path.exists(directory):
         logging.error(f"目录不存在: {directory}")
-        return
+        return None
     
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
@@ -362,17 +421,63 @@ def process_directory(directory, output_dir='output', extract_thermo_features=Tr
     
     if not pdb_files:
         logging.error(f"目录 {directory} 中未找到PDB文件")
-        return
+        return None
     
     logging.info(f"在 {directory} 中找到 {len(pdb_files)} 个PDB文件")
     
     # 处理所有PDB文件
     results = []
-    for pdb_file in pdb_files:
-        logging.info(f"处理文件: {os.path.basename(pdb_file)}")
-        features = process_pdb_file(pdb_file, extract_thermo_features=extract_thermo_features, optimized=False)
-        if features:
-            results.append(features)
+    processed_count = 0
+    error_count = 0
+    start_time = time.time()
+    last_progress_update = start_time
+    
+    for i, pdb_file in enumerate(pdb_files):
+        try:
+            # 每10个文件或30秒更新一次进度报告
+            current_time = time.time()
+            if i % 10 == 0 or current_time - last_progress_update > 30:
+                progress = (i + 1) / len(pdb_files) * 100
+                elapsed_time = current_time - start_time
+                
+                # 估计剩余时间
+                if i > 0:
+                    avg_time_per_file = elapsed_time / (i + 1)
+                    remaining_files = len(pdb_files) - (i + 1)
+                    remaining_time = avg_time_per_file * remaining_files
+                    
+                    # 格式化时间显示
+                    if remaining_time > 3600:
+                        time_str = f"{remaining_time/3600:.1f}小时"
+                    else:
+                        time_str = f"{remaining_time/60:.1f}分钟"
+                    
+                    logging.info(f"进度: {progress:.1f}% ({i+1}/{len(pdb_files)}), 预计剩余时间: {time_str}")
+                else:
+                    logging.info(f"进度: {progress:.1f}% ({i+1}/{len(pdb_files)})")
+                
+                last_progress_update = current_time
+            
+            logging.info(f"处理文件: {os.path.basename(pdb_file)}")
+            features = process_pdb_file(pdb_file, extract_thermo_features=extract_thermo_features, optimized=optimized)
+            
+            if features:
+                if 'error' in features:
+                    logging.warning(f"处理 {os.path.basename(pdb_file)} 失败: {features['error']}")
+                    error_count += 1
+                else:
+                    results.append(features)
+                    processed_count += 1
+        except Exception as e:
+            logging.error(f"处理 {pdb_file} 时发生异常: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            error_count += 1
+    
+    # 报告处理结果
+    total_time = time.time() - start_time
+    logging.info(f"PDB文件处理完成. 总计: {len(pdb_files)}, 成功: {processed_count}, 失败: {error_count}")
+    logging.info(f"总处理时间: {total_time/60:.1f}分钟 (平均每个文件 {total_time/len(pdb_files):.1f}秒)")
     
     # 保存到CSV
     if results:
@@ -395,9 +500,15 @@ def process_directory(directory, output_dir='output', extract_thermo_features=Tr
         for aa in aa_types:
             fieldnames.add(f"aa_{aa}")
         
+        # 将pdb_id放在最前面
+        fieldnames_list = sorted(fieldnames)
+        if 'pdb_id' in fieldnames_list:
+            fieldnames_list.remove('pdb_id')
+            fieldnames_list.insert(0, 'pdb_id')
+        
         # 写入CSV
         with open(output_file, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=sorted(fieldnames))
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames_list)
             writer.writeheader()
             for result in results:
                 row = {}
@@ -454,9 +565,15 @@ def main():
                 for aa in features['aa_composition'].keys():
                     fieldnames.add(f"aa_{aa}")
             
+            # 将pdb_id放在最前面
+            fieldnames_list = sorted(fieldnames)
+            if 'pdb_id' in fieldnames_list:
+                fieldnames_list.remove('pdb_id')
+                fieldnames_list.insert(0, 'pdb_id')
+            
             # 写入CSV
             with open(output_file, 'w', newline='') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=sorted(fieldnames))
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames_list)
                 writer.writeheader()
                 
                 row = {}

@@ -83,13 +83,13 @@ def load_data(data_file):
         logging.error(f"加载数据失败: {str(e)}")
         raise
 
-def temperature_weighted_sampling(X, y, temp_threshold=70, weight_factor=3):
+def temperature_weighted_sampling(X, y, temp_threshold=60, weight_factor=3):
     """为高温样本增加权重，用于训练时平衡不同温度区间样本的影响
     
     参数:
         X: 特征矩阵
         y: 温度标签
-        temp_threshold: 高温阈值，默认70°C
+        temp_threshold: 高温阈值，默认60°C
         weight_factor: 高温样本权重系数，默认3.0
         
     返回:
@@ -248,270 +248,173 @@ def apply_nonlinear_transform(X):
 def prepare_features(data, apply_feature_selection=True, use_interaction=False, 
                     use_nonlinear=False, use_polynomial=False, balance_temperatures=False,
                     custom_features=None):
-    """准备特征数据，支持多种特征工程选项
+    """准备模型训练所需特征
     
     参数:
-        data: 输入数据DataFrame
+        data: 包含特征的DataFrame
         apply_feature_selection: 是否应用特征选择
-        use_interaction: 是否添加特征交互
-        use_nonlinear: 是否添加非线性变换
-        use_polynomial: 是否添加多项式特征
-        balance_temperatures: 是否平衡温度样本
-        custom_features: 自定义特征列表文件
+        use_interaction: 是否使用特征交互项
+        use_nonlinear: 是否使用非线性特征变换
+        use_polynomial: 是否使用多项式特征
+        balance_temperatures: 是否平衡高低温样本
+        custom_features: 自定义特征列表
         
     返回:
-        (X, y, feature_cols)
+        处理后的特征矩阵X和标签y
     """
-    logging.info("准备特征数据...")
+    logging.info(f"准备特征，使用专家推荐的热稳定性关键特征")
     
-    # 使用自定义特征列表（如果提供）
-    if custom_features and os.path.exists(custom_features):
-        try:
-            with open(custom_features, 'r') as f:
-                feature_cols = [line.strip() for line in f if line.strip()]
-            logging.info(f"已加载{len(feature_cols)}个自定义特征")
-        except Exception as e:
-            logging.error(f"加载自定义特征失败: {str(e)}")
-            feature_cols = None
+    if 'optimal_temperature' not in data.columns:
+        logging.error("数据中缺少optimal_temperature列，无法继续")
+        return None, None
+    
+    # 复制数据避免修改原始数据
+    df = data.copy()
+    
+    # 特征选择和工程步骤
+    excluded_cols = ['pdb_id', 'optimal_temperature', 'error']
+    
+    # 确保排除非数值列
+    for col in df.columns:
+        if df[col].dtype == 'object' or df[col].dtype == 'string':
+            if col not in excluded_cols:
+                logging.info(f"发现非数值列: {col}，将其添加到排除列表")
+                excluded_cols.append(col)
+    
+    # 根据蛋白质热稳定性专家知识选择关键特征，按照数据集中实际可用的特征
+    key_features = [
+        # 氨基酸组成相关特征
+        'ivywrel_index',             # 热稳定性相关的氨基酸指数(Val, Ile, Tyr, Trp, Arg, Glu, Leu)
+        'aa_ARG_ratio',              # 精氨酸比例-生成带电侧链
+        'aa_GLU_ratio',              # 谷氨酸比例-生成带电侧链
+        'aa_LYS_ratio',              # 赖氨酸比例-生成带电侧链
+        'aa_HIS_ratio',              # 组氨酸比例-生成带电侧链
+        'aa_ASP_ratio',              # 天冬氨酸比例-生成带电侧链
+        
+        # 结构特征
+        'helix_ratio',               # α-螺旋比例
+        'sheet_ratio',               # β-折叠比例
+        'helix_sheet_ratio',         # 螺旋/折叠比例
+        'compactness_index',         # 紧密度指数
+        'disulfide_bonds_ratio',     # 二硫键比例
+        
+        # 表面特征
+        'hydrophobic_sasa_ratio',    # 疏水SASA比例
+        'surface_charge_ratio',      # 表面电荷比例
+        'surface_polar_ratio',       # 表面极性比例
+        'mean_sasa_per_residue',     # 每残基平均溶剂可及表面积
+        
+        # 相互作用特征
+        'ion_pair_density',          # 离子对密度
+        'salt_bridges_ratio',        # 盐桥比例
+        'hydrogen_bonds_ratio',      # 氢键比例
+        'aromatic_interactions',     # 芳香相互作用
+        'hydrophobic_core_density',  # 疏水核心密度
+        
+        # 整体特性指标
+        'hydrophobic_content',       # 疏水含量
+        'polar_content',             # 极性含量
+        'glycine_content',           # 甘氨酸含量-提供灵活性
+        'proline_content',           # 脯氨酸含量-提供刚性
+        'core_residue_ratio'         # 核心残基比例
+    ]
+    
+    # 检查数据中是否含有这些关键特征
+    available_features = []
+    for feature in key_features:
+        if feature in df.columns:
+            available_features.append(feature)
+        else:
+            logging.warning(f"关键特征'{feature}'在数据中不存在")
+    
+    if not available_features:
+        logging.warning("未找到任何关键特征，将使用所有数值特征")
+        available_features = [col for col in df.columns if col not in excluded_cols]
     else:
-        feature_cols = None
+        logging.info(f"使用 {len(available_features)} 个热稳定性关键特征: {', '.join(available_features)}")
     
-    # 获取所有可能的特征列
-    if feature_cols is None:
-        # 排除非特征列
-        exclude_cols = ['pdb_id', 'optimal_temperature', 'Unnamed: 0', 'ec_number', 
-                       'source_organism', 'protein_name', 'sequence']
-        
-        feature_cols = [col for col in data.columns if col not in exclude_cols]
+    # 提取特征
+    X = df[available_features]
+    y = df['optimal_temperature']
     
-    # 创建特征矩阵和目标变量
-    X = data[feature_cols].copy()
-    y = data['optimal_temperature'].copy()
-    
-    # 处理缺失值
-    logging.info("处理缺失值...")
-    for col in X.columns:
-        if X[col].isnull().any():
-            # 对于缺失值较多的列，使用中位数填充
-            missing_count = X[col].isnull().sum()
-            if missing_count > 0:
-                logging.info(f"  - 列 '{col}' 有 {missing_count} 个缺失值，使用中位数填充")
-                X[col] = X[col].fillna(X[col].median())
-    
-    # 移除低方差特征
-    if apply_feature_selection:
-        logging.info("移除低方差特征...")
-        initial_features = X.shape[1]
-        selector = VarianceThreshold(threshold=0.01)
-        X_selected = selector.fit_transform(X)
-        selected_features = [feature_cols[i] for i in range(len(feature_cols)) if selector.get_support()[i]]
-        
-        # 更新DataFrame和特征列表
-        X = pd.DataFrame(X_selected, columns=selected_features, index=X.index)
-        feature_cols = selected_features
-        logging.info(f"  - 移除了 {initial_features - len(feature_cols)} 个低方差特征，剩余 {len(feature_cols)} 个特征")
-    
-    # 添加非线性变换
+    # 可选：添加少量有意义的非线性特征
     if use_nonlinear:
-        logging.info("添加非线性特征变换...")
+        logging.info("添加热稳定性相关的非线性特征...")
+        X_with_nonlinear = X.copy()
         
-        # 创建原始特征的副本
-        original_features = X.columns.tolist()
+        # 添加特定的非线性特征，这些在生物学上有意义
+        nonlinear_transforms = {
+            # 立方根变换（代表三维空间中体积变化）
+            'cbrt': ['hydrophobic_sasa_ratio', 'surface_polar_ratio', 'hydrophobic_core_density', 'mean_sasa_per_residue'],
+            
+            # 平方变换（代表二阶相互作用）
+            'squared': ['ivywrel_index', 'ion_pair_density', 'salt_bridges_ratio', 'hydrogen_bonds_ratio'],
+            
+            # 对数变换（表示比例尺度变化）
+            'log': ['helix_sheet_ratio', 'compactness_index'],
+            
+            # Sigmoid变换（表示饱和效应）
+            'sigmoid': ['aromatic_interactions', 'disulfide_bonds_ratio']
+        }
         
-        for col in original_features:
-            # 只对数值型特征进行变换
-            if pd.api.types.is_numeric_dtype(X[col]):
-                # 添加对数变换 (对于正值特征)
-                if X[col].min() > 0:
-                    X[f'{col}_log'] = np.log1p(X[col])
-                
-                # 添加平方变换
-                X[f'{col}_squared'] = X[col] ** 2
-                
-                # 添加立方根变换
-                X[f'{col}_cbrt'] = np.cbrt(X[col])
-                
-                # 添加sigmoid变换
-                X[f'{col}_sigmoid'] = 1 / (1 + np.exp(-X[col]))
+        # 应用各种变换
+        for transform_type, features in nonlinear_transforms.items():
+            for col in features:
+                if col in X.columns:
+                    if transform_type == 'cbrt':
+                        X_with_nonlinear[f'{col}_cbrt'] = np.cbrt(X[col])
+                    elif transform_type == 'squared':
+                        X_with_nonlinear[f'{col}_squared'] = X[col] ** 2
+                    elif transform_type == 'log' and (X[col] > 0).all():
+                        X_with_nonlinear[f'{col}_log'] = np.log1p(X[col])
+                    elif transform_type == 'sigmoid':
+                        X_with_nonlinear[f'{col}_sigmoid'] = 1 / (1 + np.exp(-X[col]))
         
-        # 更新特征列表
-        feature_cols = X.columns.tolist()
-        logging.info(f"  - 添加非线性变换后的特征数量: {len(feature_cols)}")
+        X = X_with_nonlinear
+        logging.info(f"添加生物学相关非线性变换后的特征数量: {len(X.columns)}")
     
-    # 添加特征交互
+    # 可选：添加有限且有意义的特征交互
     if use_interaction:
-        logging.info("添加特征交互...")
+        logging.info("添加热稳定性相关的特征交互...")
+        X_with_interactions = X.copy()
         
-        # 训练一个初步的随机森林以获取特征重要性
-        rf_prelim = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-        rf_prelim.fit(X, y)
+        # 定义生物学上有意义的交互项
+        interaction_pairs = [
+            # 疏水性与结构的交互
+            ('hydrophobic_content', 'helix_ratio'),
+            ('hydrophobic_content', 'sheet_ratio'),
+            ('hydrophobic_content', 'core_residue_ratio'),
+            
+            # 表面特性与稳定性的交互
+            ('hydrophobic_sasa_ratio', 'salt_bridges_ratio'),
+            ('surface_charge_ratio', 'hydrogen_bonds_ratio'),
+            ('surface_polar_ratio', 'ion_pair_density'),
+            
+            # 氨基酸组成与结构的交互
+            ('ivywrel_index', 'compactness_index'),
+            ('aa_ARG_ratio', 'surface_charge_ratio'),
+            ('aa_GLU_ratio', 'salt_bridges_ratio'),
+            
+            # 热稳定性交互
+            ('ivywrel_index', 'hydrophobic_core_density'),
+            ('aa_ARG_ratio', 'aa_GLU_ratio'),  # ARG与GLU相互作用形成盐桥
+            ('glycine_content', 'proline_content'), # 灵活性与刚性平衡
+            ('helix_ratio', 'hydrogen_bonds_ratio') # 螺旋结构通过氢键稳定
+        ]
         
-        # 获取前10个最重要的特征
-        importances = rf_prelim.feature_importances_
-        indices = np.argsort(importances)[::-1][:10]  # 取前10个
-        top_features = [X.columns[i] for i in indices]
+        # 添加交互特征
+        for feat1, feat2 in interaction_pairs:
+            if feat1 in X.columns and feat2 in X.columns:
+                X_with_interactions[f'{feat1}_X_{feat2}'] = X[feat1] * X[feat2]
+            else:
+                logging.info(f"无法创建交互特征 {feat1}_X_{feat2}，因为至少一个特征不存在")
         
-        logging.info(f"  - 选择了 {len(top_features)} 个重要特征用于交互")
-        
-        # 对这些特征做交互项
-        for i in range(len(top_features)):
-            for j in range(i+1, len(top_features)):
-                feat1 = top_features[i]
-                feat2 = top_features[j]
-                # 创建交互特征
-                X[f'{feat1}_X_{feat2}'] = X[feat1] * X[feat2]
-        
-        # 更新特征列表
-        feature_cols = X.columns.tolist()
-        logging.info(f"  - 添加特征交互后的特征数量: {len(feature_cols)}")
+        X = X_with_interactions
+        logging.info(f"添加生物学相关特征交互后的特征数量: {len(X.columns)}")
     
-    # 添加多项式特征
-    if use_polynomial:
-        logging.info("添加多项式特征...")
-        
-        # 首先训练一个随机森林来找出最重要的特征
-        rf_prelim = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-        rf_prelim.fit(X, y)
-        
-        # 选择前15个最重要的特征
-        importances = rf_prelim.feature_importances_
-        indices = np.argsort(importances)[::-1][:5]  # 只取前5个，避免特征爆炸
-        top_features = [X.columns[i] for i in indices]
-        
-        # 只对最重要的特征生成多项式
-        X_top = X[top_features].copy()
-        
-        # 使用PolynomialFeatures生成2阶多项式特征
-        poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=False)
-        X_poly = poly.fit_transform(X_top)
-        
-        # 获取特征名称
-        poly_feature_names = []
-        powers = poly.powers_
-        for i, p in enumerate(powers):
-            if i < len(top_features):  # 跳过原始特征
-                continue
-                
-            # 创建特征名称
-            name = ""
-            for j, exp in enumerate(p):
-                if exp > 0:
-                    name += f"{top_features[j]}"
-                    if exp > 1:
-                        name += f"^{exp}"
-                    name += "_"
-            if name:
-                name = name[:-1]  # 移除末尾的下划线
-                poly_feature_names.append(name)
-        
-        # 将多项式特征添加到原始特征矩阵
-        X_poly_df = pd.DataFrame(X_poly[:, len(top_features):], columns=poly_feature_names, index=X.index)
-        X = pd.concat([X, X_poly_df], axis=1)
-        
-        # 更新特征列表
-        feature_cols = X.columns.tolist()
-        logging.info(f"  - 添加多项式特征后的特征数量: {len(feature_cols)}")
+    logging.info(f"最终特征处理完成，使用 {len(X.columns)} 个特征, {len(X)} 个样本")
     
-    # 应用特征选择（使用随机森林的特征重要性）
-    if apply_feature_selection and len(feature_cols) > 20:  # 如果特征数量较多
-        logging.info("基于特征重要性进行特征选择...")
-        
-        # 使用随机森林识别重要特征
-        feature_selector = SelectFromModel(
-            RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
-            threshold='median'  # 使用中位数阈值，保留约一半的特征
-        )
-        
-        # 拟合特征选择器
-        feature_selector.fit(X, y)
-        
-        # 获取选中的特征名称
-        selected_features = [feature_cols[i] for i in range(len(feature_cols)) if feature_selector.get_support()[i]]
-        
-        # 如果特征过多，则通过累积重要性法进一步筛选
-        if len(selected_features) > 30:
-            logging.info("  - 特征仍然较多，应用累积重要性筛选...")
-            
-            # 训练模型获取特征重要性
-            rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-            rf.fit(X, y)
-            
-            # 计算特征重要性
-            importances = rf.feature_importances_
-            indices = np.argsort(importances)[::-1]
-            
-            # 按重要性排序的特征
-            sorted_features = [feature_cols[i] for i in indices]
-            sorted_importances = [importances[i] for i in indices]
-            
-            # 计算累积重要性
-            cumulative_importance = np.cumsum(sorted_importances)
-            
-            # 选择重要性累积达到90%的特征
-            importance_threshold = 0.90
-            last_idx = np.where(cumulative_importance >= importance_threshold)[0][0]
-            selected_features = sorted_features[:last_idx + 1]
-            
-            logging.info(f"  - 通过累积重要性(>{importance_threshold*100}%)选择了 {len(selected_features)} 个特征")
-        
-        # 应用特征筛选
-        X = X[selected_features]
-        feature_cols = selected_features
-        logging.info(f"  - 特征选择后的特征数量: {len(feature_cols)}")
-        
-        # 显示选择的特征
-        if len(feature_cols) <= 20:
-            logging.info(f"  - 选中的特征: {', '.join(feature_cols)}")
-    
-    # 平衡温度样本（可选）
-    if balance_temperatures:
-        logging.info("平衡温度样本分布...")
-        
-        # 定义温度区间
-        temp_bins = [0, 30, 45, 60, 75, 100]
-        labels = [f"{temp_bins[i]}-{temp_bins[i+1]}" for i in range(len(temp_bins)-1)]
-        
-        # 将温度分到各个区间
-        y_binned = pd.cut(y, bins=temp_bins, labels=labels)
-        bin_counts = y_binned.value_counts()
-        
-        logging.info("  - 原始温度区间分布:")
-        for bin_label, count in bin_counts.items():
-            logging.info(f"    * {bin_label}°C: {count}个样本 ({count/len(y)*100:.1f}%)")
-        
-        # 计算权重以平衡样本
-        max_count = bin_counts.max()
-        sample_weights = np.ones(len(y))
-        
-        # 为每个温度区间分配权重
-        for bin_label in labels:
-            mask = y_binned == bin_label
-            if mask.any():
-                weight = max_count / bin_counts[bin_label]
-                sample_weights[mask] = weight
-        
-        # 通过加权采样创建平衡数据集
-        balanced_indices = np.random.choice(
-            range(len(y)), 
-            size=len(y), 
-            replace=True, 
-            p=sample_weights/sample_weights.sum()
-        )
-        
-        X = X.iloc[balanced_indices].reset_index(drop=True)
-        y = y.iloc[balanced_indices].reset_index(drop=True)
-        
-        # 检查平衡后的分布
-        y_binned = pd.cut(y, bins=temp_bins, labels=labels)
-        balanced_counts = y_binned.value_counts()
-        
-        logging.info("  - 平衡后温度区间分布:")
-        for bin_label, count in balanced_counts.items():
-            logging.info(f"    * {bin_label}°C: {count}个样本 ({count/len(y)*100:.1f}%)")
-    
-    logging.info(f"最终特征处理完成，使用 {len(feature_cols)} 个特征, {len(y)} 个样本")
-    
-    return X, y, feature_cols
+    return X, y
 
 def train_neural_network(X_train, y_train, X_test, y_test):
     """使用神经网络训练温度预测模型"""
@@ -533,7 +436,7 @@ def cross_validate_model(X, y, n_splits=5):
         return np.mean(np.abs((y_true - y_pred) / (y_true + 273.15))) * 100  # 返回相对误差百分比
     
     # 高温区域性能评估
-    def high_temp_performance(y_true, y_pred, threshold=65.0):
+    def high_temp_performance(y_true, y_pred, threshold=60.0):
         """评估模型在高温区域的性能"""
         high_temp_mask = y_true >= threshold
         if np.sum(high_temp_mask) > 0:
@@ -669,276 +572,274 @@ def cross_validate_model(X, y, n_splits=5):
     return rmse_scores.mean(), mae_scores.mean(), r2_scores.mean(), recommended_params
 
 def train_model(X, y, output_dir='./models', test_size=0.2, recommended_params=None, model_type='random_forest', high_temp_focus=False):
-    """训练模型并返回测试集性能
-
+    """训练温度预测模型
+    
     参数:
         X: 特征矩阵
-        y: 温度标签
+        y: 目标变量
         output_dir: 模型输出目录
         test_size: 测试集比例
-        recommended_params: 推荐参数(从交叉验证获得)，如为None则使用最优默认参数
-        model_type: 模型类型 ('random_forest' 或 'gradient_boosting')
-        high_temp_focus: 是否使用高温样本权重
-
+        recommended_params: 推荐的模型参数
+        model_type: 模型类型('random_forest'或'gradient_boosting')
+        high_temp_focus: 是否特别关注高温样本
+        
     返回:
-        (model, test_rmse, high_temp_results)
-        model: 训练好的模型
-        test_rmse: 测试集均方根误差
-        high_temp_results: 高温样本评估结果
+        训练好的模型和评估指标
     """
-    # 确保输出目录存在
+    # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
     
-    # 分割数据集
+    # 分割训练集和测试集
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+    logging.info(f"数据分割完成 - 训练集: {X_train.shape[0]}, 测试集: {X_test.shape[0]}")
     
-    # 创建适当的样本权重（可选）
+    # 为高温样本添加权重
+    sample_weights = None
     if high_temp_focus:
-        # 为高温样本分配更高权重
-        temp_weights = np.ones(len(y_train))
-        high_temp_indices = np.where(y_train >= 65.0)[0]
-        temp_weights[high_temp_indices] = 3.0  # 为高温样本赋予3倍权重
-        logging.info(f"应用高温样本权重: {len(high_temp_indices)}个样本分配了3倍权重")
-    else:
-        temp_weights = None
+        sample_weights = temperature_weighted_sampling(X_train, y_train)
+        logging.info(f"应用高温样本权重 - 添加了权重的样本数: {np.sum(sample_weights > 1)}")
     
-    # 如果没有提供推荐参数，使用最优默认参数
-    if recommended_params is None:
-        if model_type == 'random_forest':
-            # 随机森林最优默认参数
-            recommended_params = {
-                'n_estimators': 300,
-                'max_depth': 30,
-                'min_samples_split': 5,
-                'min_samples_leaf': 2,
-                'max_features': 'sqrt',
-                'bootstrap': True
-            }
-            logging.info("使用随机森林最优默认参数")
-        else:  # gradient_boosting
-            # 梯度提升树最优默认参数
-            recommended_params = {
-                'n_estimators': 200,
-                'max_depth': 5,
-                'min_samples_split': 5,
-                'learning_rate': 0.05,
-                'subsample': 0.8
-            }
-            logging.info("使用梯度提升最优默认参数")
-    
-    # 选择模型类型
-    if model_type == 'gradient_boosting':
-        # 创建验证集用于早停
-        X_train_part, X_val, y_train_part, y_val = train_test_split(
-            X_train, y_train, test_size=0.2, random_state=42)
-            
-        # 使用推荐的参数
-        base_params = {
-            'n_estimators': recommended_params.get('n_estimators', 500),  # 使用更多树
-            'max_depth': recommended_params.get('max_depth', 5),
-            'min_samples_split': recommended_params.get('min_samples_split', 2),
-            'learning_rate': recommended_params.get('learning_rate', 0.05),  # 默认较低的学习率
-            'subsample': recommended_params.get('subsample', 0.8),
-            'random_state': 42
-        }
+    # 训练模型
+    if model_type == 'random_forest':
+        logging.info("训练随机森林回归模型...")
         
-        logging.info(f"训练梯度提升回归树模型，参数: {base_params}")
-        
-        # 创建模型
-        model = GradientBoostingRegressor(**base_params)
-        
-        # 使用早停策略训练
-        model.fit(
-            X_train_part, y_train_part,
-            eval_set=[(X_val, y_val)],
-            eval_metric='rmse',
-            early_stopping_rounds=20,  # 20轮无改善则早停
-            verbose=False,
-            sample_weight=temp_weights if temp_weights is not None else None
-        )
-        
-        # 获取最佳迭代次数
-        if hasattr(model, 'best_iteration_'):
-            best_iteration = model.best_iteration_
-            logging.info(f"早停在第{best_iteration}轮，使用最佳迭代进行最终训练")
-            
-            # 使用最佳迭代重新训练完整模型
-            final_params = base_params.copy()
-            final_params['n_estimators'] = best_iteration
-            
-            # 在完整训练集上训练最终模型
-            model = GradientBoostingRegressor(**final_params)
-            model.fit(X_train, y_train, sample_weight=temp_weights)
-            logging.info(f"最终模型使用参数: {final_params}")
-        else:
-            # 如果早停未生效，在完整训练集上重新训练
-            logging.info("早停未生效，使用完整训练集训练模型")
-            model = GradientBoostingRegressor(**base_params)
-            model.fit(X_train, y_train, sample_weight=temp_weights)
-            
-    else:
-        # 随机森林模型
-        rf_params = {
-            'n_estimators': recommended_params.get('n_estimators', 300),
-            'max_depth': recommended_params.get('max_depth', 30),
-            'min_samples_split': recommended_params.get('min_samples_split', 5),
-            'min_samples_leaf': recommended_params.get('min_samples_leaf', 2),
-            'max_features': recommended_params.get('max_features', 'sqrt'),
-            'bootstrap': recommended_params.get('bootstrap', True),
+        # 使用简化的随机森林参数
+        params = {
+            'n_estimators': 200,       # 使用中等数量的树
+            'max_depth': 10,           # 限制树的深度减少过拟合
+            'min_samples_split': 5,    # 需要更多样本才能分裂
+            'min_samples_leaf': 3,     # 每个叶节点至少3个样本 
+            'max_features': 'sqrt',    # 限制每次使用的特征数量
             'random_state': 42,
             'n_jobs': -1
         }
-        logging.info(f"使用随机森林模型，参数: {rf_params}")
         
-        model = RandomForestRegressor(**rf_params)
+        # 如果有推荐参数，则覆盖默认参数
+        if recommended_params:
+            params.update(recommended_params)
+            logging.info(f"使用推荐参数: {recommended_params}")
+        
+        # 创建并训练模型
+        model = RandomForestRegressor(**params)
+        logging.info(f"开始训练随机森林模型，参数: {params}")
         
         # 训练模型
-        logging.info("开始训练模型...")
-        model.fit(X_train, y_train, sample_weight=temp_weights)
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+        logging.info("随机森林模型训练完成")
+        
+    elif model_type == 'gradient_boosting':
+        logging.info("训练梯度提升回归模型...")
+        
+        # 使用简化的梯度提升参数，增加正则化
+        params = {
+            'n_estimators': 150,        # 中等数量的树
+            'learning_rate': 0.05,      # 小学习率减少过拟合
+            'max_depth': 5,             # 浅树减少过拟合 
+            'min_samples_split': 5,     # 需要更多样本才能分裂
+            'subsample': 0.8,           # 使用80%样本训练每棵树
+            'colsample_bytree': 0.8,    # 使用80%特征训练每棵树
+            'alpha': 0.1,               # L1正则化
+            'random_state': 42
+        }
+        
+        # 如果有推荐参数，则覆盖默认参数
+        if recommended_params:
+            params.update(recommended_params)
+            logging.info(f"使用推荐参数: {recommended_params}")
+        
+        # 创建并训练模型
+        model = GradientBoostingRegressor(**params)
+        logging.info(f"开始训练梯度提升模型，参数: {params}")
+        
+        # 训练模型
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+        logging.info("梯度提升模型训练完成")
+        
+    elif model_type == 'xgboost':
+        logging.info("训练XGBoost回归模型...")
+        
+        try:
+            import xgboost as xgb
+            from sklearn.model_selection import GridSearchCV
+            
+            # 初始XGBoost参数 - 注重更强的正则化来避免过拟合
+            params = {
+                'n_estimators': 200,        # 适当增加树数量
+                'learning_rate': 0.03,      # 更小的学习率
+                'max_depth': 4,             # 控制树的深度，减少过拟合
+                'min_child_weight': 5,      # 增加以减少过拟合
+                'subsample': 0.7,           # 减少每棵树用到的样本比例
+                'colsample_bytree': 0.7,    # 减少每棵树用到的特征比例
+                'colsample_bylevel': 0.7,   # 每次分裂随机选择部分特征
+                'reg_alpha': 0.5,           # 更强的L1正则化
+                'reg_lambda': 1.5,          # 更强的L2正则化
+                'gamma': 0.1,               # 树节点分裂的最小损失减少，控制过拟合
+                'random_state': 42
+            }
+            
+            # 如果有推荐参数，则覆盖默认参数
+            if recommended_params:
+                params.update(recommended_params)
+                logging.info(f"使用推荐参数: {recommended_params}")
+                
+                # 直接使用提供的参数训练模型
+                model = xgb.XGBRegressor(**params)
+                logging.info(f"开始训练XGBoost模型，使用提供的参数")
+                model.fit(X_train, y_train, sample_weight=sample_weights)
+            else:
+                # 执行网格搜索找到最佳参数
+                logging.info("执行XGBoost参数网格搜索...")
+                
+                # 创建基础模型
+                base_model = xgb.XGBRegressor(
+                    n_estimators=200,
+                    learning_rate=0.03,
+                    reg_alpha=0.5,
+                    reg_lambda=1.5,
+                    random_state=42
+                )
+                
+                # 定义参数网格
+                param_grid = {
+                    'max_depth': [3, 4, 5],
+                    'min_child_weight': [3, 5, 7],
+                    'subsample': [0.6, 0.7, 0.8],
+                    'colsample_bytree': [0.6, 0.7, 0.8],
+                    'gamma': [0, 0.1, 0.2]
+                }
+                
+                # 创建网格搜索
+                grid_search = GridSearchCV(
+                    estimator=base_model,
+                    param_grid=param_grid,
+                    scoring='neg_mean_squared_error',
+                    cv=5,
+                    verbose=1,
+                    n_jobs=-1
+                )
+                
+                # 执行网格搜索
+                grid_search.fit(X_train, y_train, sample_weight=sample_weights)
+                
+                # 获取最佳参数
+                best_params = grid_search.best_params_
+                logging.info(f"XGBoost最佳参数: {best_params}")
+                
+                # 使用最佳参数创建最终模型
+                final_params = {
+                    'n_estimators': 200,
+                    'learning_rate': 0.03,
+                    'reg_alpha': 0.5,
+                    'reg_lambda': 1.5,
+                    'random_state': 42,
+                    **best_params
+                }
+                
+                # 创建最终模型
+                model = xgb.XGBRegressor(**final_params)
+                logging.info(f"使用最佳参数训练最终XGBoost模型: {final_params}")
+                
+                # 训练最终模型
+                model.fit(X_train, y_train, sample_weight=sample_weights)
+            
+            logging.info("XGBoost模型训练完成")
+        except ImportError:
+            logging.error("未安装XGBoost库，无法使用XGBoost模型。请使用'pip install xgboost'安装。")
+            logging.info("使用梯度提升模型作为替代...")
+            return train_model(X, y, output_dir, test_size, recommended_params, 'gradient_boosting', high_temp_focus)
     
-    # 预测并评估测试集
+    else:
+        raise ValueError(f"不支持的模型类型: {model_type}")
+    
+    # 评估模型性能
+    logging.info("评估模型性能...")
+    
+    # 在测试集上进行预测
     y_pred = model.predict(X_test)
-    test_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    test_mae = mean_absolute_error(y_test, y_pred)
-    test_r2 = r2_score(y_test, y_pred)
+    
+    # 计算评估指标
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
     
     logging.info(f"测试集评估结果:")
-    logging.info(f"  RMSE: {test_rmse:.2f}")
-    logging.info(f"  MAE: {test_mae:.2f}")
-    logging.info(f"  R²: {test_r2:.2f}")
+    logging.info(f"  - RMSE: {rmse:.2f}")
+    logging.info(f"  - MAE: {mae:.2f}")
+    logging.info(f"  - R²: {r2:.2f}")
     
-    # 特别评估高温样本的性能（温度 >= 65°C）
-    high_temp_mask = y_test >= 65.0
-    if high_temp_mask.any():
-        high_temp_y = y_test[high_temp_mask]
-        high_temp_pred = y_pred[high_temp_mask]
-        high_temp_rmse = np.sqrt(mean_squared_error(high_temp_y, high_temp_pred))
-        high_temp_mae = mean_absolute_error(high_temp_y, high_temp_pred)
-        high_temp_r2 = r2_score(high_temp_y, high_temp_pred)
-        
-        logging.info(f"高温样本评估结果 (>= 65°C, {high_temp_mask.sum()}个样本):")
-        logging.info(f"  RMSE: {high_temp_rmse:.2f}")
-        logging.info(f"  MAE: {high_temp_mae:.2f}")
-        logging.info(f"  R²: {high_temp_r2:.2f}")
-        
-        high_temp_results = {
-            'rmse': high_temp_rmse,
-            'mae': high_temp_mae,
-            'r2': high_temp_r2,
-            'count': high_temp_mask.sum()
-        }
-    else:
-        logging.warning("测试集中没有高温样本")
-        high_temp_results = {}
+    # 评估高温预测性能
+    high_temp_metrics = evaluate_high_temperature_performance(y_test, y_pred)
+    logging.info(f"高温样本(≥60.0°C)性能:")
+    logging.info(f"  - 高温RMSE: {high_temp_metrics['high_temp_rmse']:.2f}")
+    logging.info(f"  - 高温MAE: {high_temp_metrics['high_temp_mae']:.2f}")
+    logging.info(f"  - 高温R²: {high_temp_metrics['high_temp_r2']:.2f}")
     
     # 分析特征重要性
-    if hasattr(model, 'feature_importances_'):
+    logging.info("分析特征重要性...")
+    try:
+        importances = model.feature_importances_
         feature_names = X.columns
-        feature_importances = model.feature_importances_
         
-        # 按重要性排序
-        indices = np.argsort(feature_importances)[::-1]
+        # 创建特征重要性数据结构
+        feature_importance = pd.DataFrame({
+            'feature': feature_names,
+            'importance': importances
+        }).sort_values('importance', ascending=False)
         
-        logging.info("特征重要性分析:")
-        for i, idx in enumerate(indices[:15]):  # 只显示前15个特征
-            logging.info(f"  {i+1}. {feature_names[idx]}: {feature_importances[idx]:.4f}")
-        
-        # 提取重要特征列表 (重要性 > 0.01)
-        important_features = []
-        for i, idx in enumerate(indices):
-            if feature_importances[idx] > 0.01:
-                important_features.append(feature_names[idx])
-        
-        logging.info(f"重要特征(>0.01)数量: {len(important_features)}")
+        # 记录前10个最重要的特征
+        top_features = feature_importance.head(10)
+        logging.info("重要特征:")
+        for i, row in top_features.iterrows():
+            logging.info(f"  - {row['feature']}: {row['importance']:.4f}")
+            
+        # 记录重要性大于0.01的特征数量
+        important_count = np.sum(importances > 0.01)
+        logging.info(f"重要性大于0.01的特征数量: {important_count}")
+    except Exception as e:
+        logging.warning(f"无法分析特征重要性: {str(e)}")
     
-    # 保存模型和特征名称
-        model_package = {
-            'model': model,
-            'feature_names': X.columns.tolist(),
-        'model_type': model_type,
-        'training_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    # 绘制结果
+    try:
+        setup_chinese_font()  # 设置中文显示
+        
+        # 创建预测图
+        plot_predictions(y_test, y_pred, output_dir)
+        
+        # 创建残差图
+        plot_residuals(y_test, y_pred, output_dir)
+        
+        # 绘制高温性能图
+        plot_high_temp_performance(y_test, y_pred, output_dir)
+        
+        # 绘制特征重要性图
+        plot_feature_importance(model, X, output_dir, model_type)
+    except Exception as e:
+        logging.warning(f"无法创建可视化图表: {str(e)}")
+    
+    # 保存模型和评估指标
+    model_package = {
+        'model': model,
+        'feature_names': list(X.columns),
         'metrics': {
-            'rmse': test_rmse,
-            'r2': test_r2,
-            'high_temp_results': high_temp_results
-        }
+            'rmse': rmse,
+            'mae': mae,
+            'r2': r2,
+            'high_temp_metrics': high_temp_metrics
+        },
+        'model_type': model_type
     }
     
-    # 保存模型包
-    model_file = os.path.join(output_dir, f'temperature_predictor_{model_type}.joblib')
-    joblib.dump(model_package, model_file)
-    logging.info(f"模型已保存至: {model_file}")
+    model_filename = f"temperature_predictor_{model_type}.joblib"
+    model_path = os.path.join(output_dir, model_filename)
+    joblib.dump(model_package, model_path)
+    logging.info(f"模型和性能指标已保存到: {model_path}")
     
-    # 绘制预测vs实际图
-    plt.figure(figsize=(8, 8))
-    
-    # 配置中文字体
-    setup_chinese_font()
-    
-    # 高温和低温样本使用不同颜色
-    high_temp_mask = y_test >= 65.0
-    
-    # 画出高温和低温样本
-    if np.any(high_temp_mask):
-        plt.scatter(y_test[high_temp_mask], y_pred[high_temp_mask], color='red', alpha=0.6, label='高温样本 (≥65°C)')
-    
-    if np.any(~high_temp_mask):
-        plt.scatter(y_test[~high_temp_mask], y_pred[~high_temp_mask], color='blue', alpha=0.6, label='低温样本 (<65°C)')
-    
-    # 添加对角线（完美预测）
-    plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], 'k--', label='理想预测')
-    
-    plt.xlabel('实际温度 (°C)')
-    plt.ylabel('预测温度 (°C)')
-    plt.title('测试集: 预测温度 vs 实际温度')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.legend()
-    
-    # 添加RMSE和R²文本
-    plt.annotate(f'整体 RMSE: {test_rmse:.2f}\n整体 R²: {test_r2:.2f}', 
-                xy=(0.05, 0.95), xycoords='axes fraction',
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
-    
-    # 如果有高温样本，添加高温性能
-    if high_temp_mask.any():
-        plt.annotate(f'高温 RMSE: {high_temp_rmse:.2f}\n高温 R²: {high_temp_r2:.2f}', 
-                    xy=(0.05, 0.82), xycoords='axes fraction',
-                    bbox=dict(boxstyle="round,pad=0.3", fc="mistyrose", alpha=0.8))
-    
-    # 保存图表
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'prediction_performance_{model_type}.png'), dpi=150)
-    plt.close()
-        
-    # 绘制误差分布图
-    plt.figure(figsize=(10, 6))
-    
-    # 配置中文字体
-    setup_chinese_font()
-    
-    errors = y_pred - y_test
-    plt.hist(errors, bins=20, color='skyblue', edgecolor='black', alpha=0.7)
-    plt.axvline(x=0, color='r', linestyle='--', alpha=0.7, label='零误差')
-    
-    # 计算误差统计
-    mean_error = np.mean(errors)
-    std_error = np.std(errors)
-    
-    plt.title(f'预测误差分布 ({model_type})')
-    plt.xlabel('预测误差 (°C)')
-    plt.ylabel('频率')
-    plt.grid(True, linestyle='--', alpha=0.3)
-    
-    # 添加误差统计
-    plt.annotate(f'平均误差: {mean_error:.2f}°C\n标准差: {std_error:.2f}°C', 
-                xy=(0.05, 0.95), xycoords='axes fraction',
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'error_distribution_{model_type}.png'), dpi=150)
-    plt.close()
-    
-    return model, test_rmse, high_temp_results
+    return model, {
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2,
+        'high_temp_metrics': high_temp_metrics
+    }
 
 def plot_model_comparison(X_test, y_test, models, output_dir):
     """绘制不同模型的性能比较"""
@@ -1203,7 +1104,7 @@ def process_directory(directory_path, model_path, output_dir=None):
         # 打印每个PDB文件的预测结果
         for index, row in pdb_data.iterrows():
             # 检查是否为高温蛋白
-            is_high_temp = row['predicted_temperature'] >= 70
+            is_high_temp = row['predicted_temperature'] >= 60
             temp_indicator = "【高温】" if is_high_temp else "【低温】"
             logging.info(f"预测结果 - {row['pdb_id']}: {row['predicted_temperature']:.2f}°C {temp_indicator}")
         
@@ -1301,61 +1202,50 @@ def show_help():
 
 def parse_args():
     """解析命令行参数"""
-    # 检查是否要显示帮助
-    if '--help' in sys.argv or '-h' in sys.argv:
-        show_help()
-        
-    parser = argparse.ArgumentParser(description='Protein temperature prediction model training')
-    parser.add_argument('--data', default='./trainData/analyze_pdb_merged.csv',
-                      help='Path to merged training data CSV file')
-    parser.add_argument('--output', default='./result',
-                      help='Output directory for models and evaluation results')
-    parser.add_argument('--predict', default=None,
-                      help='Prediction mode: specify PDB file or directory path')
-    parser.add_argument('--model', default=None,
-                      help='Prediction mode: specify model file path')
-    # 添加模型类型参数
-    parser.add_argument('--model_type', default='random_forest', choices=['random_forest', 'gradient_boosting'],
-                      help='Model type to use: random_forest or gradient_boosting')
-    # 简化选项，默认值设为True
-    parser.add_argument('--interactions', action='store_true', default=True,
-                      help='Use feature interactions')
-    parser.add_argument('--high_temp_focus', action='store_true', default=True,
-                      help='Apply high temperature sample weighting (3x)')
-    parser.add_argument('--synthetic_samples', action='store_true',
-                      help='Generate synthetic samples for high temperature range')
-    parser.add_argument('--nonlinear', action='store_true', default=True,
-                      help='Apply nonlinear feature transformations')
-    parser.add_argument('--polynomial', action='store_true', default=True,
-                      help='Add polynomial features')
-    parser.add_argument('--balance', action='store_true', default=True,
-                      help='Balance temperature ranges in training data')
-    parser.add_argument('--test_size', type=float, default=0.2,
-                      help='Test set size, default is 0.2 (20%%)')
-    parser.add_argument('--full_pipeline', action='store_true',
-                      help='Run full pipeline: feature extraction -> data merge -> model training')
-    parser.add_argument('--pdb_dir', 
-                      help='PDB files directory for full pipeline training')
-    parser.add_argument('--cazy_file',
-                      help='CAZY data file path for full pipeline training')
-    parser.add_argument('--features',
-                      help='Path to custom feature list')
-    # 预测选项
-    parser.add_argument('--optimized', action='store_true',
-                      help='Use optimized feature extraction (only for prediction mode)')
-    parser.add_argument('--no-extract', action='store_true',
-                      help='Skip feature extraction when predicting')
-    parser.add_argument('--output_dir', default=None,
-                      help='Optional custom directory for prediction results (default: ./result/predictions)')
+    import argparse
+    parser = argparse.ArgumentParser(description='训练蛋白质温度预测模型')
+    
+    # 数据相关参数
+    parser.add_argument('--data', type=str, help='训练数据CSV文件路径')
+    parser.add_argument('--output', type=str, help='模型输出目录')
+    parser.add_argument('--output_dir', type=str, help='模型输出目录 (与--output相同，保持向后兼容性)')
+    parser.add_argument('--test_size', type=float, default=0.2, help='测试集比例，默认0.2')
+    
+    # 模型相关参数
+    parser.add_argument('--model_type', type=str, default='random_forest', 
+                       choices=['random_forest', 'gradient_boosting', 'xgboost'],
+                       help='模型类型: random_forest, gradient_boosting, xgboost')
+    parser.add_argument('--high_temp_focus', action='store_true', help='重点关注高温蛋白质预测准确性')
+    
+    # 特征工程参数
+    parser.add_argument('--interactions', action='store_true', help='使用特征交互项')
+    parser.add_argument('--nonlinear', action='store_true', help='使用非线性特征变换')
+    parser.add_argument('--polynomial', action='store_true', help='使用多项式特征')
+    parser.add_argument('--balance', action='store_true', help='平衡温度样本分布')
+    parser.add_argument('--features', type=str, help='要使用的特征列表，逗号分隔')
+    
+    # 管道参数
+    parser.add_argument('--full_pipeline', action='store_true', help='使用完整训练流程（从PDB文件开始）')
+    parser.add_argument('--pdb_dir', type=str, help='PDB文件目录（用于完整流程）')
+    parser.add_argument('--cazy_file', type=str, help='CAZy数据文件路径（用于完整流程）')
+    
+    # 预测参数
+    parser.add_argument('--predict', type=str, help='预测模式：指定要预测的PDB ID或目录')
+    parser.add_argument('--model', type=str, help='用于预测的模型路径')
+    parser.add_argument('--no-extract', action='store_true', help='不执行特征提取步骤')
+    
     return parser.parse_args()
 
-def evaluate_high_temperature_performance(y_true, y_pred, high_temp_threshold=65):
-    """专门评估高温区域的预测性能 - 优化版
+def evaluate_high_temperature_performance(y_true, y_pred, high_temp_threshold=60):
+    """评估高温区域预测性能
     
     参数:
-        y_true: 真实温度值
-        y_pred: 预测温度值
-        high_temp_threshold: 高温阈值，默认65°C（调整后）
+        y_true: 真实值
+        y_pred: 预测值
+        high_temp_threshold: 高温阈值，默认60°C
+        
+    返回:
+        包含高温区域性能指标的字典
     """
     # 筛选高温数据
     high_temp_mask = y_true >= high_temp_threshold
@@ -1365,10 +1255,20 @@ def evaluate_high_temperature_performance(y_true, y_pred, high_temp_threshold=65
         logging.warning(f"没有高温样本(≥{high_temp_threshold}°C)用于评估")
         return {
             'count': 0,
-            'rmse': float('nan'),
-            'mae': float('nan'),
-            'r2': float('nan'),
-            'rel_error': float('nan')
+            'high_temp_rmse': float('nan'),
+            'high_temp_mae': float('nan'),
+            'high_temp_r2': float('nan'),
+            'high_temp_rel_error': float('nan'),
+            'error_stats': {
+                'mean_error': float('nan'),
+                'median_error': float('nan'),
+                'error_std': float('nan'),
+                'max_error': float('nan'),
+                'q90_error': float('nan')
+            },
+            'very_high_temp_count': 0,
+            'very_high_temp_rmse': float('nan'),
+            'very_high_temp_mae': float('nan')
         }
     
     # 提取高温区域的真实值和预测值
@@ -1412,6 +1312,7 @@ def evaluate_high_temperature_performance(y_true, y_pred, high_temp_threshold=65
     logging.info(f"  高温90%分位误差: {error_stats['q90_error']:.2f}°C")
     
     # 超高温区域评估 (>80°C)
+    very_high_temp_dict = {}
     very_high_temp_mask = y_true >= 80
     if sum(very_high_temp_mask) > 0:
         very_high_temp_true = y_true[very_high_temp_mask]
@@ -1422,27 +1323,40 @@ def evaluate_high_temperature_performance(y_true, y_pred, high_temp_threshold=65
         logging.info(f"  超高温区域(≥80°C)样本数量: {sum(very_high_temp_mask)}")
         logging.info(f"  超高温RMSE: {very_high_temp_rmse:.2f}")
         logging.info(f"  超高温MAE: {very_high_temp_mae:.2f}")
+        
+        very_high_temp_dict = {
+            'very_high_temp_count': sum(very_high_temp_mask),
+            'very_high_temp_rmse': very_high_temp_rmse,
+            'very_high_temp_mae': very_high_temp_mae
+        }
+    else:
+        very_high_temp_dict = {
+            'very_high_temp_count': 0,
+            'very_high_temp_rmse': float('nan'),
+            'very_high_temp_mae': float('nan')
+        }
     
     return {
         'count': high_temp_count,
-        'rmse': high_temp_rmse,
-        'mae': high_temp_mae,
-        'r2': high_temp_r2,
-        'rel_error': high_temp_rel_error,
+        'high_temp_rmse': high_temp_rmse,
+        'high_temp_mae': high_temp_mae,
+        'high_temp_r2': high_temp_r2,
+        'high_temp_rel_error': high_temp_rel_error,
         'error_stats': error_stats,
-        'very_high_temp_count': sum(very_high_temp_mask) if 'very_high_temp_mask' in locals() else 0,
-        'very_high_temp_rmse': very_high_temp_rmse if 'very_high_temp_rmse' in locals() else float('nan'),
-        'very_high_temp_mae': very_high_temp_mae if 'very_high_temp_mae' in locals() else float('nan')
+        **very_high_temp_dict
     }
 
-def plot_high_temp_performance(y_true, y_pred, output_dir, threshold=65):
-    """生成高温区域性能评估图表
+def plot_high_temp_performance(y_true, y_pred, output_dir, threshold=60):
+    """绘制高温区域预测性能
     
     参数:
         y_true: 真实温度值
         y_pred: 预测温度值
-        output_dir: 输出目录
-        threshold: 高温阈值，默认65°C
+        output_dir: 图表输出目录
+        threshold: 高温阈值，默认60°C
+        
+    返回:
+        None
     """
     # 配置中文字体
     setup_chinese_font()
@@ -1495,120 +1409,172 @@ def plot_high_temp_performance(y_true, y_pred, output_dir, threshold=65):
 def full_training_pipeline(pdb_dir, cazy_file=None, model_output_dir='./models', high_temp_focus=False, 
                           test_size=0.2, model_type='random_forest', use_nonlinear=False, 
                           use_interactions=False, use_polynomial=False, balance_temperatures=False):
-    """完整训练流程: 特征提取->合并数据->训练模型
+    """执行完整的分析和训练流程
     
     参数:
         pdb_dir: PDB文件目录
-        cazy_file: CAZY数据文件（可选）
+        cazy_file: CAZy数据文件（可选）
         model_output_dir: 模型输出目录
-        high_temp_focus: 使用高温专家模型
+        high_temp_focus: 是否重点关注高温蛋白
         test_size: 测试集比例
-        model_type: 模型类型，'random_forest'或'gradient_boosting'
-        use_nonlinear: 是否使用非线性特征
+        model_type: 模型类型
+        use_nonlinear: 是否使用非线性特征变换
         use_interactions: 是否使用特征交互
         use_polynomial: 是否使用多项式特征
-        balance_temperatures: 是否平衡温度区间样本
+        balance_temperatures: 是否平衡温度分布
     
     返回:
-        是否成功
+        训练是否成功
     """
     try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 第一步：提取蛋白质特征
+        logging.info("执行完整训练流程")
+        logging.info(f"步骤1: 从{pdb_dir}提取蛋白质特征...")
         
-        # 确保输出目录存在
-        os.makedirs(model_output_dir, exist_ok=True)
-        
-        # 步骤1: 特征提取
-        logging.info("第1步: 从PDB文件提取特征")
+        # 直接调用analyze_pdb.py处理整个目录
         cmd = ['python', 'analyze_pdb.py', pdb_dir, '--thermostability']
         logging.info(f"执行命令: {' '.join(cmd)}")
-        proc = subprocess.run(cmd, capture_output=True, text=True)
         
-        if proc.returncode != 0:
-            logging.error(f"特征提取失败: {proc.stderr}")
+        try:
+            # 使用更健壮的subprocess调用方法
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                check=False,  # 不自动抛出异常，我们会手动检查返回码
+                timeout=3600  # 设置超时时间为1小时
+            )
+            
+            # 记录stdout和stderr
+            if result.stdout:
+                for line in result.stdout.split('\n'):
+                    if line.strip():
+                        logging.info(f"PDB分析输出: {line.strip()}")
+                        
+            if result.stderr:
+                for line in result.stderr.split('\n'):
+                    if line.strip():
+                        logging.warning(f"PDB分析警告: {line.strip()}")
+            
+            # 检查返回码
+            if result.returncode != 0:
+                logging.error(f"分析PDB文件失败，返回代码: {result.returncode}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logging.error("PDB分析超时。请检查是否有大量PDB文件或处理过慢。")
+            return False
+        except Exception as e:
+            logging.error(f"执行analyze_pdb.py时出错: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return False
+        
+        # 等待两秒确保文件已经写入磁盘
+        logging.info("等待文件系统更新...")
+        time.sleep(2)
+        
+        # 查找分析文件
+        analyze_files = glob.glob(os.path.join('output', 'analyze_pdb_*.csv'))
+        if not analyze_files:
+            logging.error("运行analyze_pdb.py后未找到任何分析结果文件")
+            return False
+        
+        # 使用最新的分析文件
+        analysis_file = max(analyze_files, key=os.path.getmtime)
+        if not os.path.exists(analysis_file):
+            logging.error(f"找不到分析文件: {analysis_file}")
             return False
             
-        # 查找最新的分析结果文件
-        output_dir = 'output'  # analyze_pdb.py的默认输出目录
-        analysis_files = []
-        for file in os.listdir(output_dir):
-            if file.startswith('analyze_pdb_') and file.endswith('.csv'):
-                file_path = os.path.join(output_dir, file)
-                analysis_files.append((file_path, os.path.getmtime(file_path)))
-        
-        if not analysis_files:
-            logging.error("未找到分析结果文件")
-            return False
-        
-        # 获取最新的文件
-        analysis_files.sort(key=lambda x: x[1], reverse=True)
-        latest_analysis_file = analysis_files[0][0]
-        logging.info(f"使用最新分析结果: {latest_analysis_file}")
-        
-        # 步骤2: 合并CAZY数据（如果提供）
+        # 第二步：如果提供了CAZy文件，使用merge_data.py合并数据
         if cazy_file and os.path.exists(cazy_file):
-            logging.info("第2步: 合并CAZY温度数据")
+            logging.info(f"步骤2: 使用merge_data.py合并特征数据和CAZy温度数据...")
             
-            # 执行数据合并脚本，使用正确的参数格式
-            merge_cmd = ['python', 'merge_data.py', 
-                          '--analyze', latest_analysis_file,
-                          '--cazy', cazy_file]
+            # 调用merge_data.py合并数据
+            merge_cmd = ['python', 'merge_data.py', '--cazy', cazy_file]
             logging.info(f"执行命令: {' '.join(merge_cmd)}")
-            merge_proc = subprocess.run(merge_cmd, capture_output=True, text=True)
             
-            if merge_proc.returncode != 0:
-                logging.error(f"数据合并失败: {merge_proc.stderr}")
+            try:
+                merge_result = subprocess.run(
+                    merge_cmd, 
+                    capture_output=True, 
+                    text=True, 
+                    check=False,
+                    timeout=600  # 10分钟超时
+                )
+                
+                # 记录输出
+                if merge_result.stdout:
+                    for line in merge_result.stdout.split('\n'):
+                        if line.strip():
+                            logging.info(f"数据合并输出: {line.strip()}")
+                            
+                if merge_result.stderr:
+                    for line in merge_result.stderr.split('\n'):
+                        if line.strip():
+                            logging.warning(f"数据合并警告: {line.strip()}")
+                
+                # 检查返回码
+                if merge_result.returncode != 0:
+                    logging.error(f"合并数据失败，返回代码: {merge_result.returncode}")
+                    return False
+                    
+                # 查找合并后的文件
+                merged_files = glob.glob(os.path.join('trainData', 'analyze_pdb_merged_*.csv'))
+                if not merged_files:
+                    logging.error("未找到merge_data.py生成的合并文件")
+                    return False
+                
+                # 使用最新的合并文件
+                merged_file = max(merged_files, key=os.path.getmtime)
+                logging.info(f"使用合并数据文件: {merged_file}")
+                
+                # 加载合并后的数据
+                try:
+                    data = pd.read_csv(merged_file)
+                    logging.info(f"成功加载合并后的数据，包含{len(data)}条记录")
+                except Exception as e:
+                    logging.error(f"加载合并数据文件时出错: {str(e)}")
+                    import traceback
+                    logging.error(traceback.format_exc())
+                    return False
+                    
+            except subprocess.TimeoutExpired:
+                logging.error("数据合并操作超时")
                 return False
-            
-            # 查找合并后的数据文件
-            merged_files = []
-            for file in os.listdir('trainData'):
-                if file.startswith('analyze_pdb_merged') and file.endswith('.csv'):
-                    file_path = os.path.join('trainData', file)
-                    merged_files.append((file_path, os.path.getmtime(file_path)))
-            
-            if not merged_files:
-                logging.error("未找到合并后的数据文件")
+            except Exception as e:
+                logging.error(f"执行merge_data.py时出错: {str(e)}")
+                import traceback
+                logging.error(traceback.format_exc())
                 return False
-            
-            # 获取最新的合并文件
-            merged_files.sort(key=lambda x: x[1], reverse=True)
-            latest_merged_file = merged_files[0][0]
-            logging.info(f"使用最新合并数据: {latest_merged_file}")
-            
-            # 步骤3: 训练模型
-            logging.info("第3步: 训练温度预测模型")
-            data = load_data(latest_merged_file)
         else:
-            # 如果没有CAZY数据，直接用分析结果并添加虚拟温度
-            logging.warning("未提供CAZY数据，使用随机温度进行测试训练")
-            
-            # 读取分析结果
-            analysis_data = pd.read_csv(latest_analysis_file)
-            
-            # 添加随机温度（仅用于测试）
-            np.random.seed(42)
-            analysis_data['optimal_temperature'] = np.random.uniform(20, 100, size=len(analysis_data))
-            
-            # 保存为合并数据格式
-            os.makedirs('trainData', exist_ok=True)
-            mock_data_file = os.path.join('trainData', f'mock_data_{timestamp}.csv')
-            analysis_data.to_csv(mock_data_file, index=False)
-            
-            logging.info(f"创建模拟数据用于测试: {mock_data_file}")
-            data = analysis_data
+            # 如果没有提供CAZy文件，尝试直接加载分析结果
+            try:
+                # 直接加载分析结果，假设它已经包含optimal_temperature
+                data = pd.read_csv(analysis_file)
+                if 'optimal_temperature' not in data.columns:
+                    logging.error("分析结果中缺少optimal_temperature列，且未提供CAZy数据")
+                    return False
+            except Exception as e:
+                logging.error(f"加载分析数据时出错: {str(e)}")
+                return False
         
-        # 数据分析
-        temp_threshold = 65.0
-        high_temp_count = sum(data['optimal_temperature'] >= temp_threshold)
+        # 训练数据分析
         total_count = len(data)
+        temp_threshold = 60.0
+        high_temp_count = sum(data['optimal_temperature'] >= temp_threshold)
         
-        logging.info(f"数据集温度分布统计:")
+        logging.info("数据集分析:")
         logging.info(f"  总样本数: {total_count}")
         logging.info(f"  数据集中高温样本(≥{temp_threshold}°C): {high_temp_count} ({high_temp_count/total_count*100:.1f}%)")
         
+        # 创建模型输出目录
+        if model_output_dir:
+            os.makedirs(model_output_dir, exist_ok=True)
+            logging.info(f"模型输出目录: {model_output_dir}")
+        
         # 准备特征 - 增强版本
-        X, y, feature_cols = prepare_features(
+        X, y = prepare_features(
             data, 
             apply_feature_selection=True,
             use_interaction=use_interactions,
@@ -1617,32 +1583,44 @@ def full_training_pipeline(pdb_dir, cazy_file=None, model_output_dir='./models',
             balance_temperatures=balance_temperatures
         )
         
+        # 检查特征和样本数
+        if len(X) == 0 or len(X.columns) == 0:
+            logging.error("特征提取失败，没有可用的特征或样本")
+            return False
+            
+        logging.info(f"特征提取完成，得到 {len(X.columns)} 个特征和 {len(X)} 个样本")
+        
         # 直接使用最优参数，不需要交叉验证搜索参数
         logging.info("使用最优默认参数训练模型...")
         
-        # 训练最终模型 - 这里传入None将使用train_model内部的最优默认参数
-        model, test_rmse, high_temp_results = train_model(
-            X, y, 
-            output_dir=model_output_dir,
-            test_size=test_size,
-            recommended_params=None,  # 将使用函数内的最优默认参数
-            model_type=model_type,
-            high_temp_focus=high_temp_focus
-        )
-        
-        # 输出完整评估报告
-        logging.info("\n" + "="*50)
-        logging.info("训练完成! 模型评估报告:")
-        logging.info(f"  数据集大小: {len(X)} 样本")
-        logging.info(f"  特征数量: {len(feature_cols)} 个")
-        logging.info(f"  模型类型: {model_type}")
-        logging.info(f"  测试集RMSE: {test_rmse:.2f}")
-        logging.info(f"  高温区域RMSE: {high_temp_results.get('rmse', 0.0):.2f}")
-        logging.info(f"  高温区域R²: {high_temp_results.get('r2', 0.0):.2f}")
-        logging.info(f"  模型保存路径: {os.path.join(model_output_dir, f'temperature_predictor_{model_type}.joblib')}")
-        logging.info("="*50)
-        
-        return True
+        try:
+            # 训练最终模型 - 这里传入None将使用train_model内部的最优默认参数
+            model, metrics = train_model(
+                X, y, 
+                output_dir=model_output_dir,
+                test_size=test_size,
+                recommended_params=None,  # 将使用函数内的最优默认参数
+                model_type=model_type,
+                high_temp_focus=high_temp_focus
+            )
+            
+            # 输出完整评估报告
+            logging.info("\n" + "="*50)
+            logging.info("训练完成! 模型评估报告:")
+            logging.info(f"  数据集大小: {len(X)} 样本")
+            logging.info(f"  特征数量: {len(X.columns)} 个")
+            logging.info(f"  模型类型: {model_type}")
+            logging.info(f"  测试集RMSE: {metrics['rmse']:.2f}")
+            logging.info(f"  测试集R²: {metrics['r2']:.2f}")
+            logging.info(f"  模型保存路径: {os.path.join(model_output_dir, f'temperature_predictor_{model_type}.joblib')}")
+            logging.info("="*50)
+            
+            return True
+        except Exception as e:
+            logging.error(f"模型训练失败: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return False
         
     except Exception as e:
         logging.error(f"模型训练过程中出错: {str(e)}")
@@ -1698,7 +1676,7 @@ def main(args):
         logging.info(f"  中低温样本数(<{temp_threshold}°C): {total_count - high_temp_count} ({(total_count - high_temp_count)/total_count*100:.1f}%)")
         
         # 准备特征 - 增强版本
-        X, y, feature_cols = prepare_features(
+        X, y = prepare_features(
             data, 
             apply_feature_selection=True,
             use_interaction=args.interactions,
@@ -1715,7 +1693,7 @@ def main(args):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, random_state=42)
         logging.info(f"训练集: {len(X_train)} 样本, 测试集: {len(X_test)} 样本")
         
-        model, rmse, high_temp_results = train_model(
+        model, metrics = train_model(
             X, y, 
             output_dir=args.output,
             test_size=args.test_size,
@@ -1724,7 +1702,8 @@ def main(args):
             high_temp_focus=args.high_temp_focus
         )
         
-        logging.info(f"模型训练完成，测试集RMSE: {rmse:.2f}")
+        logging.info(f"模型训练完成，测试集RMSE: {metrics['rmse']:.2f}")
+        logging.info(f"测试集R²: {metrics['r2']:.2f}")
         logging.info(f"模型和性能指标已保存至 {args.output} 目录")
         
         return True
@@ -1747,105 +1726,67 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
     返回:
         处理是否成功
     """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     if output_dir is None:
         output_dir = os.path.join('result', 'predictions')
-        
+    
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     
-    # 生成时间戳，用于文件命名
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+    # 处理文件或目录
     logging.info(f"处理目录/文件: {pdb_dir}")
     
-    # 检查输入路径是否存在
-    if not os.path.exists(pdb_dir):
-        logging.error(f"输入路径不存在: {pdb_dir}")
-        return False
-    
-    # 确定是目录还是单个文件
-    if os.path.isdir(pdb_dir):
-        # 如果需要提取特征，则运行analyze_pdb.py
-        if extract_features:
-            cmd = ['python', 'analyze_pdb.py', pdb_dir, '--thermostability']
-            logging.info(f"执行命令: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                logging.error(f"分析PDB文件失败: {result.stderr}")
-                return False
-                
-            # 等待确保文件已经写入磁盘
-            logging.info("等待文件系统更新...")
-            time.sleep(1)
-            
-            # 查找最新的分析结果文件
-            analysis_files = []
-            for file in os.listdir('output'):
-                if file.startswith('analyze_pdb_') and file.endswith('.csv'):
-                    file_path = os.path.join('output', file)
-                    analysis_files.append((file_path, os.path.getmtime(file_path)))
-            
-            if not analysis_files:
-                logging.error("未找到分析结果文件")
-                return False
-            
-            # 获取最新的文件
-            analysis_files.sort(key=lambda x: x[1], reverse=True)
-            latest_analysis_file = analysis_files[0][0]
-            logging.info(f"使用分析文件: {os.path.basename(latest_analysis_file)}")
-            
-            # 加载分析结果
-            try:
-                pdb_data = pd.read_csv(latest_analysis_file)
-                logging.info(f"成功加载分析结果，包含 {len(pdb_data)} 条记录")
-            except Exception as e:
-                logging.error(f"无法加载分析文件: {str(e)}")
-                return False
-        else:
-            # 查找最新的分析结果文件
-            analysis_files = []
-            for file in os.listdir('output'):
-                if file.startswith('analyze_pdb_') and file.endswith('.csv'):
-                    file_path = os.path.join('output', file)
-                    analysis_files.append((file_path, os.path.getmtime(file_path)))
-            
-            if not analysis_files:
-                logging.error("未找到分析结果文件，请先运行特征提取")
-                return False
-            
-            # 获取最新的文件
-            analysis_files.sort(key=lambda x: x[1], reverse=True)
-            latest_analysis_file = analysis_files[0][0]
-            logging.info(f"使用现有分析文件: {os.path.basename(latest_analysis_file)}")
-            
-            # 加载分析结果
-            try:
-                pdb_data = pd.read_csv(latest_analysis_file)
-                logging.info(f"成功加载分析结果，包含 {len(pdb_data)} 条记录")
-            except Exception as e:
-                logging.error(f"无法加载分析文件: {str(e)}")
-                return False
+    if extract_features:
+        # 提取PDB特征
+        cmd = ['python', 'analyze_pdb.py', pdb_dir, '--thermostability']
+        logging.info(f"执行命令: {' '.join(cmd)}")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if proc.returncode != 0:
+            logging.error(f"特征提取失败: {proc.stderr}")
+            return False
+        
+        # 等待文件系统更新
+        logging.info("等待文件系统更新...")
+        time.sleep(1)
+        
+        # 查找分析结果文件
+        output_dir_analyze = 'output'  # analyze_pdb.py的默认输出目录
+        analysis_files = []
+        for file in os.listdir(output_dir_analyze):
+            if file.startswith('analyze_pdb_') and file.endswith('.csv'):
+                file_path = os.path.join(output_dir_analyze, file)
+                analysis_files.append((file_path, os.path.getmtime(file_path)))
+        
+        if not analysis_files:
+            logging.error("未找到分析结果文件")
+            return False
+        
+        # 获取最新的文件
+        analysis_files.sort(key=lambda x: x[1], reverse=True)
+        latest_analysis_file = analysis_files[0][0]
+        
+        logging.info(f"使用分析文件: {os.path.basename(latest_analysis_file)}")
+        
+        # 加载分析结果
+        try:
+            pdb_data = pd.read_csv(latest_analysis_file)
+            logging.info(f"成功加载分析结果，包含 {len(pdb_data)} 条记录")
+        except Exception as e:
+            logging.error(f"无法加载分析文件: {str(e)}")
+            return False
     else:
-        # 处理单个PDB文件
-        if extract_features:
-            cmd = ['python', 'analyze_pdb.py', pdb_dir, '--thermostability']
-            logging.info(f"执行命令: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                logging.error(f"分析PDB文件失败: {result.stderr}")
-                return False
-                
-            # 等待确保文件已经写入磁盘
-            logging.info("等待文件系统更新...")
-            time.sleep(1)
-            
-            # 查找最新的分析结果文件
+        # 处理单个PDB文件的情况
+        if os.path.isfile(pdb_dir) and pdb_dir.lower().endswith(('.pdb', '.ent')):
+            # 查找与该PDB文件对应的分析结果
+            output_dir_analyze = 'output'
             analysis_files = []
-            for file in os.listdir('output'):
+            pdb_id = os.path.splitext(os.path.basename(pdb_dir))[0]
+            
+            for file in os.listdir(output_dir_analyze):
                 if file.startswith('analyze_pdb_') and file.endswith('.csv'):
-                    file_path = os.path.join('output', file)
+                    file_path = os.path.join(output_dir_analyze, file)
                     analysis_files.append((file_path, os.path.getmtime(file_path)))
             
             if not analysis_files:
@@ -1855,6 +1796,8 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
             # 获取最新的文件
             analysis_files.sort(key=lambda x: x[1], reverse=True)
             latest_analysis_file = analysis_files[0][0]
+            
+            logging.info(f"使用分析文件: {os.path.basename(latest_analysis_file)}")
             
             # 加载分析结果
             try:
@@ -1878,14 +1821,37 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
         
         logging.info(f"使用{model_type}模型进行预测")
         
-        # 检查缺失的特征并添加
-        for col in feature_names:
-            if col not in pdb_data.columns:
-                logging.warning(f"在输入数据中未找到特征: {col}，添加并设置为0")
-                pdb_data[col] = 0.0
+        # 特征替换映射：将绝对值特征替换为相应的比例特征
+        feature_replacement = {
+            'disulfide_bonds': 'disulfide_bonds_ratio',
+            'hydrogen_bonds': 'hydrogen_bonds_ratio',
+            'hydrophobic_contacts': 'hydrophobic_contacts_ratio',
+            'hydrophobic_sasa': 'hydrophobic_sasa_ratio',
+            'mean_sasa': 'mean_sasa_per_residue',
+            'salt_bridges': 'salt_bridges_ratio'
+        }
         
-        # 确保只选择模型需要的特征列
-        X = pdb_data[feature_names]
+        # 创建一个新的特征名称列表，替换掉旧特征
+        updated_feature_names = []
+        for feature in feature_names:
+            if feature in feature_replacement and feature_replacement[feature] in pdb_data.columns:
+                # 使用相应的比例特征替代绝对值特征
+                updated_feature_names.append(feature_replacement[feature])
+                logging.info(f"将绝对值特征 {feature} 替换为比例特征 {feature_replacement[feature]}")
+            else:
+                updated_feature_names.append(feature)
+        
+        # 检查缺失的特征并添加
+        for i, feature in enumerate(updated_feature_names):
+            if feature not in pdb_data.columns:
+                logging.warning(f"在输入数据中未找到特征: {feature}，添加并设置为0")
+                pdb_data[feature] = 0.0
+        
+        # 创建特征矩阵，使用更新后的特征名称
+        X = pd.DataFrame(index=pdb_data.index)
+        for i, old_feature in enumerate(feature_names):
+            new_feature = updated_feature_names[i]
+            X[old_feature] = pdb_data[new_feature]  # 将新特征的值赋给旧特征名
         
         # 检查并填充NaN值
         if X.isnull().any().any():
@@ -1897,7 +1863,7 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
         
         # 添加预测结果
         pdb_data['predicted_temperature'] = temperatures
-        pdb_data['is_high_temp'] = temperatures >= 65.0
+        pdb_data['is_high_temp'] = temperatures >= 60.0
         
         # 尝试获取高温概率（如果是使用RandomForestClassifier/RandomForestRegressor）
         has_probs = False
@@ -1922,8 +1888,8 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
                     # 计算每个样本的预测温度分布
                     tree_preds = np.column_stack(tree_preds)
                     
-                    # 估计每个样本是高温的概率（树预测温度超过65°C的比例）
-                    high_temp_probs = np.mean(tree_preds >= 65.0, axis=1)
+                    # 估计每个样本是高温的概率（树预测温度超过60°C的比例）
+                    high_temp_probs = np.mean(tree_preds >= 60.0, axis=1)
                     probabilities = high_temp_probs
                 
                 # 添加到数据框
@@ -1978,7 +1944,7 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
             sorted_temps = [temperatures[i] for i in sorted_indices]
             
             # 使用不同颜色标记高温和低温
-            colors = ['red' if temp >= 65 else 'blue' for temp in sorted_temps]
+            colors = ['red' if temp >= 60 else 'blue' for temp in sorted_temps]
             
             # 创建坐标轴
             fig, ax = plt.subplots(figsize=(14, 6))
@@ -1994,8 +1960,8 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
                       ha='center', va='bottom', rotation=0, fontsize=8)
             
             # 添加高温和分类阈值线
-            ax.axhline(y=70, color='r', linestyle='--', alpha=0.7)  # 高温阈值
-            ax.axhline(y=65, color='orange', linestyle='--', alpha=0.7)  # 分类阈值
+            ax.axhline(y=60, color='r', linestyle='--', alpha=0.7)  # 高温阈值
+            ax.axhline(y=60, color='orange', linestyle='--', alpha=0.7)  # 分类阈值
             
             # 添加颜色图例
             if has_probs:
@@ -2004,13 +1970,13 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
                 sm.set_array([])
                 cbar = plt.colorbar(sm, ax=ax)
                 cbar.set_label('高温概率')
-                ax.legend(['高温阈值 (70°C)', '分类阈值 (65°C)'], loc='upper right')
+                ax.legend(['高温阈值 (60°C)', '分类阈值 (60°C)'], loc='upper right')
             else:
                 # 创建高温和低温的模拟图例
                 from matplotlib.patches import Patch
                 legend_elements = [
-                    Line2D([0], [0], color='r', linestyle='--', lw=2, label='高温阈值 (70°C)'),
-                    Line2D([0], [0], color='orange', linestyle='--', lw=2, label='温度分类阈值 (65°C)'),
+                    Line2D([0], [0], color='r', linestyle='--', lw=2, label='高温阈值 (60°C)'),
+                    Line2D([0], [0], color='orange', linestyle='--', lw=2, label='温度分类阈值 (60°C)'),
                     Patch(facecolor='red', alpha=0.7, label='高温蛋白'),
                     Patch(facecolor='blue', alpha=0.7, label='低温蛋白')
                 ]
@@ -2109,35 +2075,36 @@ def predict_temperature(pdb_dir, model_path, args=None, output_dir=None, extract
 
 if __name__ == "__main__":
     # 设置命令行参数
-    parser = argparse.ArgumentParser(description='Protein temperature prediction model training')
+    parser = argparse.ArgumentParser(description='训练蛋白质温度预测模型')
     
     # 输入输出参数
-    parser.add_argument('--data', type=str, help='Path to merged training data CSV file')
-    parser.add_argument('--output', type=str, default='./models', help='Output directory for models and results')
-    parser.add_argument('--output_dir', type=str, help='Optional custom directory for prediction results (default: ./result/predictions)')
+    parser.add_argument('--data', type=str, help='训练数据CSV文件路径')
+    parser.add_argument('--output', type=str, help='模型输出目录')
+    parser.add_argument('--output_dir', type=str, help='模型输出目录 (与--output相同，保持向后兼容性)')
+    parser.add_argument('--test_size', type=float, default=0.2, help='测试集比例，默认0.2')
     
-    # 训练参数
-    parser.add_argument('--test_size', type=float, default=0.2, help='Test set size, default is 0.2 (20%%)')
-    parser.add_argument('--model_type', type=str, default='random_forest', choices=['random_forest', 'gradient_boosting'], 
-                        help='Model type to use: random_forest or gradient_boosting')
-    parser.add_argument('--high_temp_focus', action='store_true', help='Apply high temperature sample weighting (3x)')
+    # 模型相关参数
+    parser.add_argument('--model_type', type=str, default='random_forest', 
+                       choices=['random_forest', 'gradient_boosting', 'xgboost'],
+                       help='模型类型: random_forest, gradient_boosting, xgboost')
+    parser.add_argument('--high_temp_focus', action='store_true', help='重点关注高温蛋白质预测准确性')
     
     # 特征工程参数
-    parser.add_argument('--interactions', action='store_true', help='Use feature interactions')
-    parser.add_argument('--nonlinear', action='store_true', help='Apply nonlinear feature transformations')
-    parser.add_argument('--polynomial', action='store_true', help='Add polynomial features')
-    parser.add_argument('--balance', action='store_true', help='Balance temperature ranges in training data')
-    parser.add_argument('--features', type=str, help='Path to custom feature list')
+    parser.add_argument('--interactions', action='store_true', help='使用特征交互项')
+    parser.add_argument('--nonlinear', action='store_true', help='使用非线性特征变换')
+    parser.add_argument('--polynomial', action='store_true', help='使用多项式特征')
+    parser.add_argument('--balance', action='store_true', help='平衡温度样本分布')
+    parser.add_argument('--features', type=str, help='要使用的特征列表，逗号分隔')
     
-    # 完整流程参数
-    parser.add_argument('--full_pipeline', action='store_true', help='Run full pipeline: feature extraction -> data merge -> model training')
-    parser.add_argument('--pdb_dir', type=str, help='PDB files directory for full pipeline training')
-    parser.add_argument('--cazy_file', type=str, help='Path to CAZY data file')
+    # 管道参数
+    parser.add_argument('--full_pipeline', action='store_true', help='使用完整训练流程（从PDB文件开始）')
+    parser.add_argument('--pdb_dir', type=str, help='PDB文件目录（用于完整流程）')
+    parser.add_argument('--cazy_file', type=str, help='CAZy数据文件路径（用于完整流程）')
     
-    # 预测模式参数
-    parser.add_argument('--predict', type=str, help='Path to PDB file/directory for prediction')
-    parser.add_argument('--model', type=str, help='Path to model file (.joblib)')
-    parser.add_argument('--no-extract', action='store_true', help='Skip feature extraction when predicting')
+    # 预测参数
+    parser.add_argument('--predict', type=str, help='预测模式：指定要预测的PDB ID或目录')
+    parser.add_argument('--model', type=str, help='用于预测的模型路径')
+    parser.add_argument('--no-extract', action='store_true', help='不执行特征提取步骤')
     
     # 解析命令行参数
     args = parser.parse_args()
