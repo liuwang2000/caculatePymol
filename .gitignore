@@ -4,3 +4,6 @@ trainData/*
 Verify/*
 models/*
 prediction_results.csv
+Alphafold*
+result*
+models*
