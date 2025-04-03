@@ -1,0 +1,17 @@
+name: themo
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.6
+  - pandas
+  - numpy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - joblib
+  - tqdm
+  - pip
+  - pip:
+    - ipywidgets
+    - ipython 
