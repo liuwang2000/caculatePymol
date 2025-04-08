@@ -34,20 +34,89 @@ warnings.filterwarnings('ignore', category=UserWarning)
 def setup_chinese_font():
     """配置matplotlib支持中文显示"""
     try:
-        # 判断操作系统类型
+        # 获取matplotlib可用字体列表
+        import matplotlib.font_manager as fm
+        available_fonts = set([f.name for f in fm.fontManager.ttflist])
+        logging.info(f"可用字体数量: {len(available_fonts)}")
+        
+        # 针对不同系统的字体选项
         if sys.platform.startswith('win'):
-            # Windows系统，尝试使用微软雅黑
-            mpl.rc('font', family='Microsoft YaHei')
+            # Windows系统字体选项
+            chinese_fonts = ['Microsoft YaHei', 'SimHei', 'SimSun', 'NSimSun', 'FangSong', 'KaiTi']
         elif sys.platform.startswith('darwin'):
-            # macOS系统，尝试使用苹方
-            mpl.rc('font', family='PingFang SC')
+            # macOS系统字体选项
+            chinese_fonts = ['PingFang SC', 'STHeiti', 'Heiti TC', 'Songti SC', 'Songti TC', 'Kaiti SC', 'Kaiti TC']
         else:
-            # Linux系统，尝试使用文泉驿微米黑
-            mpl.rc('font', family='WenQuanYi Micro Hei')
+            # Linux系统字体选项 - 提供更多选项
+            chinese_fonts = [
+                'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'Noto Sans CJK SC', 'Noto Sans CJK TC', 
+                'Noto Sans CJK JP', 'Noto Sans Mono CJK SC', 'Noto Serif CJK SC', 'Source Han Sans CN',
+                'Source Han Sans TW', 'Source Han Serif CN', 'Source Han Serif TW', 'AR PL UMing CN',
+                'AR PL UKai CN', 'DejaVu Sans', 'Liberation Sans', 'Droid Sans Fallback'
+            ]
+        
+        # 查找第一个可用的中文字体
+        font_found = False
+        for font in chinese_fonts:
+            if font in available_fonts:
+                logging.info(f"找到中文字体: {font}")
+                mpl.rc('font', family=font)
+                font_found = True
+                break
+        
+        # 如果没有找到预定义的中文字体，尝试找到任何包含中文字符的字体
+        if not font_found:
+            import os
+            import subprocess
+            from matplotlib.font_manager import fontManager, FontProperties
+            
+            logging.info("预定义中文字体未找到，尝试通过系统命令查找...")
+            try:
+                # 在Linux和macOS上尝试使用fc-list查找中文字体
+                if not sys.platform.startswith('win'):
+                    # 查询支持中文的字体
+                    fc_list_cmd = "fc-list :lang=zh"
+                    fonts_output = subprocess.check_output(fc_list_cmd, shell=True, text=True)
+                    
+                    # 解析字体名称
+                    font_paths = fonts_output.split('\n')
+                    if font_paths and len(font_paths) > 0:
+                        for path in font_paths:
+                            if path.strip():
+                                # 提取字体文件路径
+                                path_parts = path.split(':')
+                                if path_parts:
+                                    font_path = path_parts[0].strip()
+                                    if os.path.exists(font_path):
+                                        logging.info(f"添加系统中文字体: {font_path}")
+                                        fontManager.addfont(font_path)
+                                        mpl.rc('font', family=FontProperties(fname=font_path).get_name())
+                                        font_found = True
+                                        break
+            except Exception as e:
+                logging.warning(f"系统字体查找失败: {str(e)}")
+            
+            # 如果仍然找不到中文字体，尝试重置字体管理器并使用任何可能支持的字体
+            if not font_found:
+                logging.warning("未找到中文字体，将尝试使用系统默认无衬线字体")
+                mpl.rcParams['font.family'] = 'sans-serif'
+                
+                # 最后的备选项
+                if 'DejaVu Sans' in available_fonts:
+                    mpl.rc('font', family='DejaVu Sans')
+                    logging.info("使用DejaVu Sans字体")
         
         # 解决负号显示问题
         mpl.rcParams['axes.unicode_minus'] = False
-        logging.info("成功配置中文字体支持")
+        
+        # 验证字体设置是否正确
+        current_font = mpl.rcParams['font.family']
+        logging.info(f"当前使用字体: {current_font}")
+        
+        if font_found:
+            logging.info("成功配置中文字体支持")
+        else:
+            logging.warning("无法找到合适的中文字体，图表中的中文可能无法正确显示")
     except Exception as e:
         logging.warning(f"配置中文字体失败: {str(e)}")
         logging.warning("图表中的中文可能无法正确显示")
@@ -55,7 +124,11 @@ def setup_chinese_font():
 # 配置日志
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(os.path.join(os.getcwd(), 'training.log'), encoding='utf-8')
+    ]
 )
 
 # 堆叠模型实现

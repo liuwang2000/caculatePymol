@@ -29,6 +29,65 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# 配置中文字体支持
+try:
+    # 尝试设置中文字体
+    import sys
+    import platform
+    
+    # 根据操作系统类型选择字体
+    if platform.system() == 'Windows':
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'KaiTi', 'STXihei', 'FangSong']
+    elif platform.system() == 'Darwin':  # macOS
+        plt.rcParams['font.sans-serif'] = ['PingFang SC', 'STHeiti', 'Heiti TC', 'Arial Unicode MS']
+    else:  # Linux
+        # Linux 环境尝试多种中文字体
+        linux_fonts = ['WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'Droid Sans Fallback', 
+                       'Noto Sans CJK SC', 'Noto Sans CJK TC', 'Source Han Sans CN', 
+                       'Source Han Sans TW', 'DejaVu Sans']
+        for font in linux_fonts:
+            plt.rcParams['font.sans-serif'] = [font] + plt.rcParams['font.sans-serif']
+    
+    # 解决负号显示问题
+    plt.rcParams['axes.unicode_minus'] = False
+    
+    # 测试中文显示
+    import matplotlib.font_manager as fm
+    fonts = [f.name for f in fm.fontManager.ttflist]
+    has_chinese_font = False
+    for font in plt.rcParams['font.sans-serif']:
+        if font in fonts:
+            has_chinese_font = True
+            logging.info(f"成功找到中文字体: {font}")
+            break
+    
+    if not has_chinese_font:
+        logging.warning("未找到支持中文的字体，图表中文可能无法正确显示")
+        # 使用通用设置
+        plt.rcParams['font.sans-serif'] = ['sans-serif']
+        # 尝试使用Agg后端，可能在某些情况下有帮助
+        plt.switch_backend('Agg')
+    else:
+        logging.info("成功配置matplotlib中文字体支持")
+except Exception as e:
+    logging.warning(f"配置中文字体时出错: {str(e)}，图表中文可能无法正确显示")
+
+# 时间格式化函数
+def format_time(seconds):
+    """将秒数格式化为中文时间表示"""
+    if seconds < 60:
+        return f"{seconds:.2f}秒"
+    elif seconds < 3600:
+        minutes = seconds // 60
+        seconds %= 60
+        return f"{int(minutes)}分钟{int(seconds)}秒"
+    else:
+        hours = seconds // 3600
+        seconds %= 3600
+        minutes = seconds // 60
+        seconds %= 60
+        return f"{int(hours)}小时{int(minutes)}分钟{int(seconds)}秒"
+
 def load_data(data_file):
     """加载训练数据"""
     logging.info(f"从{data_file}加载数据")
@@ -87,7 +146,7 @@ def evaluate_model(model, X_test, y_test):
     return r2, rmse, mae
 
 def feature_selection_by_combination(X, y, feature_cols, min_features=3, max_features=15, 
-                                    cv=5, n_estimators=150, random_state=42, top_k=10):
+                                     cv=5, random_state=42, top_k=10, test_size=0.2):
     """通过尝试不同的特征组合来找到最佳特征集"""
     # 检查特征数量是否足够
     n_features = len(feature_cols)
@@ -106,40 +165,36 @@ def feature_selection_by_combination(X, y, feature_cols, min_features=3, max_fea
     
     logging.info(f"开始特征选择，将尝试从{min_features}到{max_features}个特征的组合")
     
-    # 创建结果存储列表
-    results = []
-    
-    # 首先得到每个特征的重要性
-    init_model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state)
-    init_model.fit(X, y)
-    importances = init_model.feature_importances_
-    
-    # 按重要性排序特征
-    sorted_indices = np.argsort(importances)[::-1]
-    sorted_features = [feature_cols[i] for i in sorted_indices]
-    
-    # 为了节省时间，我们将只尝试重要性较高的前max_features*2个特征
-    max_top_features = min(len(sorted_features), max_features*2)
-    top_features = sorted_features[:max_top_features]
-    logging.info(f"根据初步重要性筛选，将使用前{len(top_features)}个重要特征进行组合测试")
-    
     # 计算总共需要尝试的组合数
     total_combinations = 0
-    for num_features in range(min_features, min(max_features + 1, len(top_features) + 1)):
-        total_combinations += len(list(combinations(top_features, num_features)))
+    for num_features in range(min_features, min(max_features + 1, n_features + 1)):
+        total_combinations += len(list(combinations(range(n_features), num_features)))
+    
     logging.info(f"需要测试{total_combinations}种特征组合")
+    
+    # 预估所需时间
+    avg_time_per_combo = 0.2  # 初步估计每个组合0.2秒
+    estimated_time = total_combinations * avg_time_per_combo
+    n_jobs = max(1, multiprocessing.cpu_count() - 1)
+    estimated_time = estimated_time / n_jobs  # 考虑并行加速
+    
+    estimated_str = format_time(estimated_time)
+    logging.info(f"预计完成特征组合测试需要约{estimated_str}，使用{n_jobs}个CPU核心并行处理")
     
     # 创建进度条
     pbar = tqdm(total=total_combinations, desc="测试特征组合")
     
+    # 创建结果存储列表
+    results = []
+    
     # 使用joblib并行处理
-    def evaluate_combination(feature_subset, n_features):
+    def evaluate_combination(feature_subset):
         # 准备数据
         X_subset = X[list(feature_subset)]
         
-        # 数据拆分（保留一部分用于交叉验证，一部分用于最终评估）
+        # 数据拆分
         X_train, X_test, y_train, y_test = train_test_split(
-            X_subset, y, test_size=0.2, random_state=random_state
+            X_subset, y, test_size=test_size, random_state=random_state
         )
         
         # 标准化数据
@@ -147,49 +202,55 @@ def feature_selection_by_combination(X, y, feature_cols, min_features=3, max_fea
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
-        # 使用交叉验证评估性能
-        model_cv = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state)
-        cv_scores = cross_val_score(model_cv, X_train_scaled, y_train, cv=cv, scoring='r2')
-        mean_cv_score = np.mean(cv_scores)
+        # 使用与train_rf_model完全相同的基础随机森林配置
+        rf = RandomForestRegressor(n_estimators=150, random_state=42)
+        rf.fit(X_train_scaled, y_train)
         
-        # 在训练集上完整训练模型
-        model_train = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state)
-        model_train.fit(X_train_scaled, y_train)
+        # 评估训练集和测试集
+        train_pred = rf.predict(X_train_scaled)
+        test_pred = rf.predict(X_test_scaled)
         
-        # 评估训练集R^2
-        y_train_pred = model_train.predict(X_train_scaled)
-        train_r2 = r2_score(y_train, y_train_pred)
+        train_r2 = r2_score(y_train, train_pred)
+        test_r2 = r2_score(y_test, test_pred)
+        test_rmse = np.sqrt(mean_squared_error(y_test, test_pred))
+        test_mae = mean_absolute_error(y_test, test_pred)
         
-        # 评估测试集R^2
-        y_test_pred = model_train.predict(X_test_scaled)
-        test_r2 = r2_score(y_test, y_test_pred)
+        # 交叉验证 - 用于额外参考
+        cv_scores = cross_val_score(rf, X_train_scaled, y_train, cv=cv, scoring='r2')
+        cv_r2 = np.mean(cv_scores)
         
         return {
             'features': feature_subset,
-            'num_features': n_features,
-            'cv_r2': mean_cv_score,
-            'cv_r2_std': np.std(cv_scores),
+            'num_features': len(feature_subset),
+            'cv_r2': cv_r2,
             'train_r2': train_r2,
             'test_r2': test_r2,
-            'model': model_train,
+            'test_rmse': test_rmse,
+            'test_mae': test_mae,
+            'model': rf,
             'scaler': scaler
         }
     
-    # 获取CPU核心数(留一个核心给系统)
-    n_jobs = max(1, multiprocessing.cpu_count() - 1)
-    logging.info(f"使用{n_jobs}个CPU核心进行并行处理")
-    
     # 为每个特征数量找到最佳组合
     all_combinations = []
-    for num_features in range(min_features, min(max_features + 1, len(top_features) + 1)):
-        for feature_subset in combinations(top_features, num_features):
-            all_combinations.append((feature_subset, num_features))
+    for num_features in range(min_features, min(max_features + 1, n_features + 1)):
+        for feature_subset in combinations(feature_cols, num_features):
+            all_combinations.append(feature_subset)
+    
+    # 记录开始时间
+    combo_start_time = time.time()
     
     # 并行执行特征组合评估
     batch_results = Parallel(n_jobs=n_jobs)(
-        delayed(evaluate_combination)(features, n_features) 
-        for features, n_features in all_combinations
+        delayed(evaluate_combination)(features) 
+        for features in all_combinations
     )
+    
+    # 计算实际耗时
+    combo_end_time = time.time()
+    combo_elapsed = combo_end_time - combo_start_time
+    combo_elapsed_str = format_time(combo_elapsed)
+    logging.info(f"特征组合测试完成，实际耗时: {combo_elapsed_str}")
     
     # 更新进度条并收集结果
     pbar.update(total_combinations)
@@ -198,8 +259,8 @@ def feature_selection_by_combination(X, y, feature_cols, min_features=3, max_fea
     # 关闭进度条
     pbar.close()
     
-    # 排序结果（首先按训练集R^2排序，然后按交叉验证R^2排序）
-    results.sort(key=lambda x: (x['train_r2'], x['cv_r2']), reverse=True)
+    # 排序结果（按测试集R^2排序）
+    results.sort(key=lambda x: x['test_r2'], reverse=True)
     
     # 返回顶部结果
     return results[:top_k]
@@ -246,7 +307,14 @@ def train_and_evaluate_best_combinations(X, y, top_combinations, random_state=42
         }
         final_results.append(result)
         
-        logging.info(f"组合 #{i+1} - 特征数: {len(features)} - 训练集 R²: {train_r2:.4f} - 测试集 R²: {test_r2:.4f}")
+        logging.info(f"组合 #{i+1} - 特征数: {len(features)} - 测试集 R²: {test_r2:.4f} - 训练集 R²: {train_r2:.4f}")
+    
+    # 按测试集R²排序
+    final_results.sort(key=lambda x: x['test_r2'], reverse=True)
+    
+    # 更新排名
+    for i, result in enumerate(final_results):
+        result['rank'] = i + 1
     
     return final_results
 
@@ -258,8 +326,8 @@ def save_model_and_results(final_results, output_dir):
     # 获取当前时间戳
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 保存最佳模型（基于训练集R^2）
-    best_result = max(final_results, key=lambda x: x['train_r2'])
+    # 保存最佳模型（基于测试集R^2）
+    best_result = max(final_results, key=lambda x: x['test_r2'])
     model_file = os.path.join(output_dir, f"best_model_{timestamp}.pkl")
     joblib.dump({
         'model': best_result['model'],
@@ -267,7 +335,7 @@ def save_model_and_results(final_results, output_dir):
         'features': best_result['features']
     }, model_file)
     logging.info(f"最佳模型已保存至 {model_file}")
-    logging.info(f"最佳模型 - 训练集 R²: {best_result['train_r2']:.4f}, 测试集 R²: {best_result['test_r2']:.4f}")
+    logging.info(f"最佳模型 - 测试集 R²: {best_result['test_r2']:.4f}, 训练集 R²: {best_result['train_r2']:.4f}")
     
     # 保存所有结果
     results_df = pd.DataFrame([
@@ -283,6 +351,11 @@ def save_model_and_results(final_results, output_dir):
         }
         for r in final_results
     ])
+    
+    # 按测试集R²排序
+    results_df = results_df.sort_values('test_r2', ascending=False).reset_index(drop=True)
+    results_df['rank'] = results_df.index + 1
+    
     results_file = os.path.join(output_dir, f"feature_selection_results_{timestamp}.csv")
     results_df.to_csv(results_file, index=False)
     logging.info(f"结果已保存至 {results_file}")
@@ -303,14 +376,16 @@ def plot_feature_importance(best_result, output_dir, timestamp):
     
     # 绘制柱状图
     plt.figure(figsize=(12, 8))
-    plt.title('特征重要性')
+    plt.title('特征重要性', fontsize=16)
     plt.bar(range(len(importances)), importances[indices], align='center')
     plt.xticks(range(len(importances)), [features[i] for i in indices], rotation=90)
+    plt.xlabel('特征名称', fontsize=14)
+    plt.ylabel('重要性分数', fontsize=14)
     plt.tight_layout()
     
     # 保存图像
     plot_file = os.path.join(output_dir, f"feature_importance_{timestamp}.png")
-    plt.savefig(plot_file)
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
     plt.close()
     logging.info(f"特征重要性图已保存至 {plot_file}")
 
@@ -334,6 +409,7 @@ def main():
     
     start_time = time.time()
     logging.info("开始特征选择优化过程...")
+    logging.info(f"预计总耗时取决于特征数量和CPU核心数，可能需要几分钟到几十分钟")
     
     # 加载数据
     data = load_data(args.data)
@@ -342,6 +418,10 @@ def main():
     X, y, feature_cols = prepare_features(data, include_aa=args.include_aa)
     logging.info(f"原始特征数量: {len(feature_cols)}")
     
+    # 根据特征数量给出粗略估计
+    if len(feature_cols) > 30:
+        logging.info(f"特征数量较多 ({len(feature_cols)}个)，请耐心等待...")
+    
     # 特征选择
     top_combinations = feature_selection_by_combination(
         X, y, feature_cols,
@@ -349,7 +429,8 @@ def main():
         max_features=args.max_features,
         cv=args.cv,
         top_k=args.top_k,
-        random_state=args.random_state
+        random_state=args.random_state,
+        test_size=args.test_size
     )
     
     # 检查是否有有效的特征组合
@@ -369,8 +450,10 @@ def main():
     
     end_time = time.time()
     elapsed_time = end_time - start_time
-    logging.info(f"特征选择优化完成，耗时: {elapsed_time:.2f}秒")
-    logging.info(f"最佳特征组合的训练集 R²: {max(final_results, key=lambda x: x['train_r2'])['train_r2']:.4f}")
+    elapsed_str = format_time(elapsed_time)
+    logging.info(f"特征选择优化完成，总耗时: {elapsed_str}")
+    # 打印最佳测试集R²的模型信息
+    logging.info(f"最佳特征组合(测试集R²最高)的测试集 R²: {max(final_results, key=lambda x: x['test_r2'])['test_r2']:.4f}")
     logging.info(f"最佳模型已保存至: {model_file}")
     logging.info(f"结果摘要已保存至: {results_file}")
 

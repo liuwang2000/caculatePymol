@@ -30,6 +30,69 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# 配置中文字体支持
+try:
+    # 尝试设置中文字体
+    import sys
+    import platform
+    
+    # 根据操作系统类型选择字体
+    if platform.system() == 'Windows':
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'KaiTi', 'STXihei', 'FangSong']
+    elif platform.system() == 'Darwin':  # macOS
+        plt.rcParams['font.sans-serif'] = ['PingFang SC', 'STHeiti', 'Heiti TC', 'Arial Unicode MS']
+    else:  # Linux
+        # Linux 环境尝试多种中文字体
+        linux_fonts = ['WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'Droid Sans Fallback', 
+                       'Noto Sans CJK SC', 'Noto Sans CJK TC', 'Source Han Sans CN', 
+                       'Source Han Sans TW', 'DejaVu Sans']
+        for font in linux_fonts:
+            plt.rcParams['font.sans-serif'] = [font] + plt.rcParams['font.sans-serif']
+    
+    # 解决负号显示问题
+    plt.rcParams['axes.unicode_minus'] = False
+    
+    # 测试中文显示
+    import matplotlib.font_manager as fm
+    fonts = [f.name for f in fm.fontManager.ttflist]
+    has_chinese_font = False
+    for font in plt.rcParams['font.sans-serif']:
+        if font in fonts:
+            has_chinese_font = True
+            logging.info(f"成功找到中文字体: {font}")
+            break
+    
+    if not has_chinese_font:
+        logging.warning("未找到支持中文的字体，图表中文可能无法正确显示")
+        # 使用通用设置
+        plt.rcParams['font.sans-serif'] = ['sans-serif']
+        # 设置seaborn样式
+        sns.set(font='sans-serif')
+        # 尝试使用Agg后端，可能在某些情况下有帮助
+        plt.switch_backend('Agg')
+    else:
+        # 设置seaborn中文字体
+        sns.set(font=plt.rcParams['font.sans-serif'][0])
+        logging.info("成功配置matplotlib和seaborn中文字体支持")
+except Exception as e:
+    logging.warning(f"配置中文字体时出错: {str(e)}，图表中文可能无法正确显示")
+
+# 时间格式化函数
+def format_time(seconds):
+    """将秒数格式化为中文时间表示"""
+    if seconds < 60:
+        return f"{seconds:.2f}秒"
+    elif seconds < 3600:
+        minutes = seconds // 60
+        seconds %= 60
+        return f"{int(minutes)}分钟{int(seconds)}秒"
+    else:
+        hours = seconds // 3600
+        seconds %= 3600
+        minutes = seconds // 60
+        seconds %= 60
+        return f"{int(hours)}小时{int(minutes)}分钟{int(seconds)}秒"
+
 def load_data(data_file):
     """加载训练数据"""
     logging.info(f"从{data_file}加载数据")
@@ -171,13 +234,35 @@ def forward_feature_selection(X, y, max_features=15, cv=5, random_state=42):
     # 获取选择的特征
     selected_features = X.columns[sfs.get_support()]
     
-    # 评估性能
+    # 数据拆分
+    X_train, X_test, y_train, y_test = train_test_split(
+        X[selected_features], y, test_size=0.2, random_state=random_state
+    )
+    
+    # 标准化数据
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # 训练完整模型
+    full_model = RandomForestRegressor(n_estimators=100, random_state=random_state)
+    full_model.fit(X_train_scaled, y_train)
+    
+    # 计算训练集R^2
+    y_train_pred = full_model.predict(X_train_scaled)
+    train_r2 = r2_score(y_train, y_train_pred)
+    
+    # 计算测试集R^2
+    y_test_pred = full_model.predict(X_test_scaled)
+    test_r2 = r2_score(y_test, y_test_pred)
+    
+    # 评估交叉验证性能
     cv_scores = cross_val_score(model, X[selected_features], y, cv=cv, scoring='r2')
     mean_cv_score = np.mean(cv_scores)
     
-    logging.info(f"前向特征选择完成，选择了{len(selected_features)}个特征，交叉验证R²: {mean_cv_score:.4f}")
+    logging.info(f"前向特征选择完成，选择了{len(selected_features)}个特征，训练集R²: {train_r2:.4f}, 交叉验证R²: {mean_cv_score:.4f}")
     
-    return list(selected_features), mean_cv_score
+    return list(selected_features), mean_cv_score, train_r2, test_r2, full_model, scaler
 
 def backward_feature_elimination(X, y, min_features=3, cv=5, random_state=42):
     """后向特征消除"""
@@ -213,13 +298,35 @@ def backward_feature_elimination(X, y, min_features=3, cv=5, random_state=42):
     # 获取选择的特征
     selected_features = X.columns[sfs.get_support()]
     
-    # 评估性能
+    # 数据拆分
+    X_train, X_test, y_train, y_test = train_test_split(
+        X[selected_features], y, test_size=0.2, random_state=random_state
+    )
+    
+    # 标准化数据
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # 训练完整模型
+    full_model = RandomForestRegressor(n_estimators=100, random_state=random_state)
+    full_model.fit(X_train_scaled, y_train)
+    
+    # 计算训练集R^2
+    y_train_pred = full_model.predict(X_train_scaled)
+    train_r2 = r2_score(y_train, y_train_pred)
+    
+    # 计算测试集R^2
+    y_test_pred = full_model.predict(X_test_scaled)
+    test_r2 = r2_score(y_test, y_test_pred)
+    
+    # 评估交叉验证性能
     cv_scores = cross_val_score(model, X[selected_features], y, cv=cv, scoring='r2')
     mean_cv_score = np.mean(cv_scores)
     
-    logging.info(f"后向特征消除完成，选择了{len(selected_features)}个特征，交叉验证R²: {mean_cv_score:.4f}")
+    logging.info(f"后向特征消除完成，选择了{len(selected_features)}个特征，训练集R²: {train_r2:.4f}, 交叉验证R²: {mean_cv_score:.4f}")
     
-    return list(selected_features), mean_cv_score
+    return list(selected_features), mean_cv_score, train_r2, test_r2, full_model, scaler
 
 def recursive_feature_elimination_cv(X, y, min_features=3, max_features=15, cv=5, random_state=42):
     """递归特征消除（带交叉验证）"""
@@ -266,13 +373,35 @@ def recursive_feature_elimination_cv(X, y, min_features=3, max_features=15, cv=5
         rfe.fit(X[selected_features], y)
         selected_features = selected_features[rfe.support_]
     
-    # 评估性能
+    # 数据拆分
+    X_train, X_test, y_train, y_test = train_test_split(
+        X[selected_features], y, test_size=0.2, random_state=random_state
+    )
+    
+    # 标准化数据
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # 训练完整模型
+    full_model = RandomForestRegressor(n_estimators=100, random_state=random_state)
+    full_model.fit(X_train_scaled, y_train)
+    
+    # 计算训练集R^2
+    y_train_pred = full_model.predict(X_train_scaled)
+    train_r2 = r2_score(y_train, y_train_pred)
+    
+    # 计算测试集R^2
+    y_test_pred = full_model.predict(X_test_scaled)
+    test_r2 = r2_score(y_test, y_test_pred)
+    
+    # 评估交叉验证性能
     cv_scores = cross_val_score(model, X[selected_features], y, cv=cv, scoring='r2', n_jobs=n_jobs)
     mean_cv_score = np.mean(cv_scores)
     
-    logging.info(f"递归特征消除完成，选择了{len(selected_features)}个特征，交叉验证R²: {mean_cv_score:.4f}")
+    logging.info(f"递归特征消除完成，选择了{len(selected_features)}个特征，训练集R²: {train_r2:.4f}, 交叉验证R²: {mean_cv_score:.4f}")
     
-    return list(selected_features), mean_cv_score
+    return list(selected_features), mean_cv_score, train_r2, test_r2, full_model, scaler
 
 def permutation_importance_selection(X, y, n_features=15, cv=5, random_state=42):
     """基于排列重要性的特征选择"""
@@ -309,13 +438,35 @@ def permutation_importance_selection(X, y, n_features=15, cv=5, random_state=42)
     # 选择前n个特征
     selected_features = X.columns[indices[:n_features]]
     
-    # 评估性能
+    # 数据拆分
+    X_train, X_test, y_train, y_test = train_test_split(
+        X[selected_features], y, test_size=0.2, random_state=random_state
+    )
+    
+    # 标准化数据
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # 训练完整模型
+    full_model = RandomForestRegressor(n_estimators=100, random_state=random_state)
+    full_model.fit(X_train_scaled, y_train)
+    
+    # 计算训练集R^2
+    y_train_pred = full_model.predict(X_train_scaled)
+    train_r2 = r2_score(y_train, y_train_pred)
+    
+    # 计算测试集R^2
+    y_test_pred = full_model.predict(X_test_scaled)
+    test_r2 = r2_score(y_test, y_test_pred)
+    
+    # 评估交叉验证性能
     cv_scores = cross_val_score(model, X[selected_features], y, cv=cv, scoring='r2')
     mean_cv_score = np.mean(cv_scores)
     
-    logging.info(f"排列重要性特征选择完成，选择了{len(selected_features)}个特征，交叉验证R²: {mean_cv_score:.4f}")
+    logging.info(f"排列重要性特征选择完成，选择了{len(selected_features)}个特征，训练集R²: {train_r2:.4f}, 交叉验证R²: {mean_cv_score:.4f}")
     
-    return list(selected_features), mean_cv_score
+    return list(selected_features), mean_cv_score, train_r2, test_r2, full_model, scaler
 
 def mutual_info_selection(X, y, n_features=15, cv=5, random_state=42):
     """基于互信息的特征选择"""
@@ -336,16 +487,38 @@ def mutual_info_selection(X, y, n_features=15, cv=5, random_state=42):
     # 选择前n个特征
     selected_features = X.columns[indices[:n_features]]
     
+    # 数据拆分
+    X_train, X_test, y_train, y_test = train_test_split(
+        X[selected_features], y, test_size=0.2, random_state=random_state
+    )
+    
+    # 标准化数据
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # 训练完整模型
+    full_model = RandomForestRegressor(n_estimators=100, random_state=random_state)
+    full_model.fit(X_train_scaled, y_train)
+    
+    # 计算训练集R^2
+    y_train_pred = full_model.predict(X_train_scaled)
+    train_r2 = r2_score(y_train, y_train_pred)
+    
+    # 计算测试集R^2
+    y_test_pred = full_model.predict(X_test_scaled)
+    test_r2 = r2_score(y_test, y_test_pred)
+    
     # 创建模型
     model = RandomForestRegressor(n_estimators=100, random_state=random_state)
     
-    # 评估性能
+    # 评估交叉验证性能
     cv_scores = cross_val_score(model, X[selected_features], y, cv=cv, scoring='r2')
     mean_cv_score = np.mean(cv_scores)
     
-    logging.info(f"互信息特征选择完成，选择了{len(selected_features)}个特征，交叉验证R²: {mean_cv_score:.4f}")
+    logging.info(f"互信息特征选择完成，选择了{len(selected_features)}个特征，训练集R²: {train_r2:.4f}, 交叉验证R²: {mean_cv_score:.4f}")
     
-    return list(selected_features), mean_cv_score
+    return list(selected_features), mean_cv_score, train_r2, test_r2, full_model, scaler
 
 def find_best_feature_combination(X, y, feature_candidates, max_combinations=10, cv=5, random_state=42):
     """找到最佳特征组合"""
@@ -492,7 +665,11 @@ def save_results(result, output_dir):
         'model': result['model'],
         'scaler': result['scaler'],
         'features': result['features'],
-        'model_name': result['model_name']
+        'model_name': result['model_name'],
+        'train_r2': result['train_r2'],
+        'test_r2': result['test_r2'],
+        'cv_r2': result['cv_r2'],
+        'method': result['method']
     }, model_file)
     logging.info(f"模型已保存至 {model_file}")
     
@@ -501,14 +678,18 @@ def save_results(result, output_dir):
     pd.DataFrame({'feature': result['features']}).to_csv(feature_file, index=False)
     logging.info(f"特征列表已保存至 {feature_file}")
     
-    # 保存预测结果
-    results_df = pd.DataFrame({
-        'actual': result['y_test'].values,
-        'predicted': result['y_pred']
+    # 保存结果摘要
+    summary_file = os.path.join(output_dir, f"results_summary_{timestamp}.csv")
+    summary_df = pd.DataFrame({
+        'method': [result['method']],
+        'num_features': [len(result['features'])],
+        'train_r2': [result['train_r2']],
+        'test_r2': [result['test_r2']],
+        'cv_r2': [result['cv_r2']],
+        'features': [','.join(result['features'])]
     })
-    results_file = os.path.join(output_dir, f"predictions_{timestamp}.csv")
-    results_df.to_csv(results_file, index=False)
-    logging.info(f"预测结果已保存至 {results_file}")
+    summary_df.to_csv(summary_file, index=False)
+    logging.info(f"结果摘要已保存至 {summary_file}")
     
     # 绘制实际值与预测值的散点图
     plot_predictions(result, output_dir, timestamp)
@@ -519,61 +700,76 @@ def save_results(result, output_dir):
     return model_file
 
 def plot_predictions(result, output_dir, timestamp):
-    """绘制实际值与预测值的对比图"""
-    plt.figure(figsize=(10, 7))
+    """绘制预测值与实际值对比图"""
+    # 提取所需数据
+    model = result['model']
+    scaler = result['scaler']
+    features = result['features']
     
-    # 散点图
-    plt.scatter(result['y_test'], result['y_pred'], alpha=0.7)
+    # 拆分训练集和测试集
+    X_train, X_test, y_train, y_test = train_test_split(
+        result['X'][features], result['y'], 
+        test_size=0.2, random_state=42
+    )
     
-    # 理想线 (y=x)
-    min_val = min(result['y_test'].min(), result['y_pred'].min())
-    max_val = max(result['y_test'].max(), result['y_pred'].max())
-    plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+    # 标准化数据
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
     
-    plt.xlabel('实际值')
-    plt.ylabel('预测值')
-    plt.title(f'模型预测 vs 实际值 (R² = {result["test_r2"]:.4f})')
-    plt.grid(True, alpha=0.3)
+    # 获取预测值
+    y_train_pred = model.predict(X_train_scaled)
+    y_test_pred = model.predict(X_test_scaled)
     
-    # 添加回归方程和R²
-    plt.annotate(f'R² = {result["test_r2"]:.4f}\nRMSE = {result["test_rmse"]:.3f}\nMAE = {result["test_mae"]:.3f}',
-                xy=(0.05, 0.95), xycoords='axes fraction',
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8),
-                ha='left', va='top')
+    # 创建图表
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
     
-    plt.tight_layout()
-    plot_file = os.path.join(output_dir, f"prediction_scatter_{timestamp}.png")
-    plt.savefig(plot_file, dpi=300)
+    # 训练集预测对比
+    ax1.scatter(y_train, y_train_pred, alpha=0.6, color='blue')
+    ax1.plot([y_train.min(), y_train.max()], [y_train.min(), y_train.max()], 'k--', lw=2)
+    ax1.set_xlabel('实际值', fontsize=14)
+    ax1.set_ylabel('预测值', fontsize=14)
+    ax1.set_title(f'训练集 (R² = {result["train_r2"]:.4f})', fontsize=16)
+    
+    # 测试集预测对比
+    ax2.scatter(y_test, y_test_pred, alpha=0.6, color='red')
+    ax2.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'k--', lw=2)
+    ax2.set_xlabel('实际值', fontsize=14)
+    ax2.set_ylabel('预测值', fontsize=14)
+    ax2.set_title(f'测试集 (R² = {result["test_r2"]:.4f})', fontsize=16)
+    
+    plt.suptitle(f'预测值与实际值对比 - {result["method"]} - {len(features)}个特征', fontsize=18)
+    
+    # 保存图像
+    plot_file = os.path.join(output_dir, f"predictions_{timestamp}.png")
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
     plt.close()
-    logging.info(f"预测散点图已保存至 {plot_file}")
+    logging.info(f"预测对比图已保存至 {plot_file}")
 
 def plot_feature_importance(result, output_dir, timestamp):
     """绘制特征重要性图"""
+    # 提取所需数据
     model = result['model']
     features = result['features']
     
     # 获取特征重要性
     importances = model.feature_importances_
     indices = np.argsort(importances)[::-1]
+    sorted_features = [features[i] for i in indices]
+    sorted_importances = importances[indices]
     
-    # 选择前15个或全部特征（较小的值）
-    n_features = min(15, len(features))
-    
-    # 绘制柱状图
+    # 根据特征数量调整图表大小
     plt.figure(figsize=(12, 8))
-    plt.title('特征重要性')
     
-    # 颜色映射
-    colors = plt.cm.viridis(np.linspace(0, 0.8, n_features))
+    # 绘制水平条形图（便于显示长特征名）
+    y_pos = np.arange(len(sorted_features))
+    plt.barh(y_pos, sorted_importances, align='center')
+    plt.yticks(y_pos, sorted_features)
+    plt.xlabel('重要性分数', fontsize=14)
+    plt.title(f'特征重要性 - {result["method"]}', fontsize=16)
     
-    plt.barh(range(n_features), importances[indices[:n_features]], align='center', color=colors)
-    plt.yticks(range(n_features), [features[i] for i in indices[:n_features]])
-    plt.xlabel('重要性')
-    plt.gca().invert_yaxis()  # 颠倒Y轴以使重要性最高的在顶部
-    
-    plt.tight_layout()
+    # 保存图像
     plot_file = os.path.join(output_dir, f"feature_importance_{timestamp}.png")
-    plt.savefig(plot_file, dpi=300)
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
     plt.close()
     logging.info(f"特征重要性图已保存至 {plot_file}")
 
@@ -582,15 +778,31 @@ def feature_correlation_matrix(X, features, output_dir, timestamp):
     # 计算相关性矩阵
     corr_matrix = X[features].corr()
     
-    # 绘制热图
+    # 根据特征数量调整图表大小
     plt.figure(figsize=(14, 12))
-    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", linewidths=0.5)
-    plt.title('特征相关性矩阵')
+    
+    # 设置热图
+    mask = np.zeros_like(corr_matrix, dtype=bool)
+    mask[np.triu_indices_from(mask, 1)] = True  # 仅显示下三角
+    
+    # 绘制热图
+    sns.heatmap(
+        corr_matrix, 
+        mask=mask,
+        annot=True,   # 显示数值
+        fmt=".2f",    # 数值格式化
+        cmap='coolwarm',  # 使用蓝红渐变色
+        vmin=-1, vmax=1,  # 相关性范围
+        linewidths=0.5,
+        annot_kws={"size": 8}  # 调整注释大小
+    )
+    
+    plt.title('特征相关性矩阵', fontsize=16)
     plt.tight_layout()
     
     # 保存图像
     plot_file = os.path.join(output_dir, f"feature_correlation_{timestamp}.png")
-    plt.savefig(plot_file, dpi=300)
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
     plt.close()
     logging.info(f"特征相关性矩阵已保存至 {plot_file}")
 
@@ -616,6 +828,7 @@ def main():
     
     start_time = time.time()
     logging.info("开始高级特征选择优化...")
+    logging.info(f"预计需要几分钟到几十分钟时间，取决于特征数量和CPU核心数")
     
     # 加载数据
     data = load_data(args.data)
@@ -630,55 +843,116 @@ def main():
     )
     logging.info(f"特征处理后的特征数量: {len(feature_cols)}")
     
+    total_features = len(feature_cols)
+    if total_features > 30:
+        estimated_time = (total_features * 2) // 60  # 粗略估计，每个特征约2秒
+        logging.info(f"特征较多，预计完成时间约为{estimated_time}分钟以上，请耐心等待...")
+    
     # 检查特征数量是否足够
     if len(feature_cols) <= 1:
         logging.error(f"可用特征数量({len(feature_cols)})太少，无法进行特征选择。请考虑包含更多特征或启用氨基酸比例特征。")
         return
     
+    # 进度信息
+    logging.info("将依次执行5种特征选择方法：前向特征选择、后向特征消除、递归特征消除、排列重要性和互信息特征选择")
+    
     # 运行不同的特征选择方法
     feature_candidates = []
     
     # 前向特征选择
-    features_fwd, score_fwd = forward_feature_selection(
+    features_fwd, score_fwd, train_r2_fwd, test_r2_fwd, model_fwd, scaler_fwd = forward_feature_selection(
         X, y, max_features=args.max_features, cv=args.cv, random_state=args.random_state
     )
-    feature_candidates.append((features_fwd, score_fwd))
+    feature_candidates.append({
+        'features': features_fwd, 
+        'cv_r2': score_fwd,
+        'train_r2': train_r2_fwd,
+        'test_r2': test_r2_fwd,
+        'model': model_fwd,
+        'scaler': scaler_fwd,
+        'method': '前向特征选择'
+    })
     
     # 后向特征消除
-    features_bwd, score_bwd = backward_feature_elimination(
+    features_bwd, score_bwd, train_r2_bwd, test_r2_bwd, model_bwd, scaler_bwd = backward_feature_elimination(
         X, y, min_features=args.min_features, cv=args.cv, random_state=args.random_state
     )
-    feature_candidates.append((features_bwd, score_bwd))
+    feature_candidates.append({
+        'features': features_bwd, 
+        'cv_r2': score_bwd,
+        'train_r2': train_r2_bwd,
+        'test_r2': test_r2_bwd,
+        'model': model_bwd,
+        'scaler': scaler_bwd,
+        'method': '后向特征消除'
+    })
     
     # 递归特征消除
-    features_rfe, score_rfe = recursive_feature_elimination_cv(
+    features_rfe, score_rfe, train_r2_rfe, test_r2_rfe, model_rfe, scaler_rfe = recursive_feature_elimination_cv(
         X, y, min_features=args.min_features, max_features=args.max_features, 
         cv=args.cv, random_state=args.random_state
     )
-    feature_candidates.append((features_rfe, score_rfe))
+    feature_candidates.append({
+        'features': features_rfe, 
+        'cv_r2': score_rfe,
+        'train_r2': train_r2_rfe,
+        'test_r2': test_r2_rfe,
+        'model': model_rfe,
+        'scaler': scaler_rfe,
+        'method': '递归特征消除'
+    })
     
     # 排列重要性
-    features_perm, score_perm = permutation_importance_selection(
+    features_perm, score_perm, train_r2_perm, test_r2_perm, model_perm, scaler_perm = permutation_importance_selection(
         X, y, n_features=args.max_features, cv=args.cv, random_state=args.random_state
     )
-    feature_candidates.append((features_perm, score_perm))
+    feature_candidates.append({
+        'features': features_perm, 
+        'cv_r2': score_perm,
+        'train_r2': train_r2_perm,
+        'test_r2': test_r2_perm,
+        'model': model_perm,
+        'scaler': scaler_perm,
+        'method': '排列重要性'
+    })
     
     # 互信息特征选择
-    features_mi, score_mi = mutual_info_selection(
+    features_mi, score_mi, train_r2_mi, test_r2_mi, model_mi, scaler_mi = mutual_info_selection(
         X, y, n_features=args.max_features, cv=args.cv, random_state=args.random_state
     )
-    feature_candidates.append((features_mi, score_mi))
+    feature_candidates.append({
+        'features': features_mi, 
+        'cv_r2': score_mi,
+        'train_r2': train_r2_mi,
+        'test_r2': test_r2_mi,
+        'model': model_mi,
+        'scaler': scaler_mi,
+        'method': '互信息特征选择'
+    })
     
-    # 找到最佳特征组合
-    best_features, best_score = find_best_feature_combination(
-        X, y, feature_candidates, max_combinations=args.max_features, 
-        cv=args.cv, random_state=args.random_state
-    )
+    # 按测试集R^2排序
+    feature_candidates.sort(key=lambda x: x['test_r2'], reverse=True)
     
-    # 训练最终模型
-    result = train_final_model(
-        X, y, best_features, test_size=args.test_size, random_state=args.random_state
-    )
+    # 找到测试集R^2最高的模型
+    best_candidate = feature_candidates[0]
+    logging.info(f"最佳特征选择方法: {best_candidate['method']}, 测试集R²: {best_candidate['test_r2']:.4f}, 训练集R²: {best_candidate['train_r2']:.4f}")
+    
+    # 使用测试集R^2最高的特征集找到最佳特征组合
+    best_features = best_candidate['features']
+    
+    # 保存最终模型结果（使用最佳特征集已训练的模型）
+    result = {
+        'model': best_candidate['model'],
+        'model_name': 'RandomForest',
+        'scaler': best_candidate['scaler'],
+        'features': best_features,
+        'train_r2': best_candidate['train_r2'],
+        'test_r2': best_candidate['test_r2'],
+        'cv_r2': best_candidate['cv_r2'],
+        'method': best_candidate['method'],
+        'X': X,
+        'y': y
+    }
     
     # 保存结果
     model_file = save_results(result, args.output)
@@ -689,8 +963,9 @@ def main():
     
     end_time = time.time()
     elapsed_time = end_time - start_time
-    logging.info(f"高级特征选择优化完成，耗时: {elapsed_time:.2f}秒")
-    logging.info(f"最佳特征组合 ({len(best_features)}个特征) 的测试集 R²: {result['test_r2']:.4f}")
+    elapsed_str = format_time(elapsed_time)
+    logging.info(f"高级特征选择优化完成，总耗时: {elapsed_str}")
+    logging.info(f"最佳特征组合 ({len(best_features)}个特征) 的测试集 R²: {best_candidate['test_r2']:.4f}")
     logging.info(f"模型已保存至: {model_file}")
 
 if __name__ == "__main__":
